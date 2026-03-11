@@ -3,7 +3,7 @@ import { getDb } from "../config/mongdodb.config";
 
 export const get_all_sales_orders = async (req: Request, res: Response) => {
     try {
-
+ 
         const db = await getDb("netsuite");
         const collection = db.collection("suite_sales_order");
 
