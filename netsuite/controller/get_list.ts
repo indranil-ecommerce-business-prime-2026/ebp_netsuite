@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { getDb } from "../../master_list/config/mongdodb.config";
+import { getDb } from "../config/mongdodb.config";
 
 export const get_all_sales_orders = async (req: Request, res: Response) => {
     try {
