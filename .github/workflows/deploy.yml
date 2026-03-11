@@ -19,4 +19,4 @@ jobs:
             cd /ebpconsole/ebp_netsuite
             git pull origin main
             npm install
-            pm2 restart all
+            pm2 reload vg_netsuite
