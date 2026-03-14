@@ -86,19 +86,19 @@ app.listen(PORT, () => {
 });
 
 // ─── CRON: Every 30 mins — Sales Orders ──────────────────────────────────────
-// cron.schedule("*/2 * * * *", async () => {
-//     console.log("[CRON] [SO] Step 1 — Staging sales orders...");
-//     // await stageSalesOrders();
+cron.schedule("*/30 * * * *", async () => {
+    console.log("[CRON] [SO] Step 1 — Staging sales orders...");
+    await stageSalesOrders();
 
-//     console.log("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-//     await syncSalesOrdersToNetsuite();
-// });
+    console.log("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+    await syncSalesOrdersToNetsuite();
+});
 
 // ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
-// cron.schedule("*/2 * * * *", async () => {
-//     console.log("[CRON] [PO] Step 1 — Staging purchase orders (shipped / invoiced)...");
-//     await stagePurchaseOrders();
-//
-//     console.log("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-//     await syncPurchaseOrdersToNetsuite();
-// });
+cron.schedule("*/30 * * * *", async () => {
+    console.log("[CRON] [PO] Step 1 — Staging purchase orders (shipped / invoiced)...");
+    await stagePurchaseOrders();
+
+    console.log("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+    await syncPurchaseOrdersToNetsuite();
+});
