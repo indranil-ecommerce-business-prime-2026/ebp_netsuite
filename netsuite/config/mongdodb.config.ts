@@ -19,6 +19,12 @@ export async function connectMongoBase(): Promise<Connection> {
 // ✅ No "mongodb" import here
 export async function getDb(dbName: string) {
   const baseConn = await connectMongoBase();
+
+  // Wait for the connection to be fully open before using .db
+  if (baseConn.readyState !== 1) {
+    await new Promise<void>((resolve) => baseConn.once("open", resolve));
+  }
+
   const conn = baseConn.useDb(dbName, { useCache: true });
 
   if (!conn.db) throw new Error("Mongo DB not ready");
