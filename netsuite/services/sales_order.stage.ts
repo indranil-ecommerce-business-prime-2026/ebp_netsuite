@@ -19,15 +19,14 @@ interface SimplePO {
 }
 
 interface SalesOrder {
-    otherrefnum: string;
-    trandate: Date;
+    otherrefnum: string;          // Amazon Order ID (unique key, maps to PO # in NetSuite)
+    trandate: Date;               // amazon_orders_v3.PurchaseDate
+    store_type: string;           // tpx_orders.store_type (e.g., "amazon") — drives Customer + Channel lookups
     order_status: string;
     fulfillment_channel: string;
     ship_date: string | null;
     items_shipped: number;
     items_unshipped: number;
-    location: string;
-    ship_from: string;
     items: SalesItem[];
     po: SimplePO[];
 }
@@ -40,7 +39,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
 
     const SYNC_STATUSES = ["Unshipped", "PartiallyShipped", "Shipped", "InvoiceUnconfirmed"];
 
-    // 1️⃣ Amazon orders
+    // 1. Amazon orders
     console.log("[SO Stage] Step 1 — Fetching amazon_orders_v3...");
     const ebp_db = await getDb("ebp_marketplace");
     const amazon_cursor = ebp_db.collection("amazon_orders_v3").find({
@@ -48,19 +47,19 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         OrderStatus: { $in: SYNC_STATUSES }
     });
 
-    // 2️⃣ TPX map (ship-to address)
-    console.log("[SO Stage] Step 2 — Building TPX address map...");
+    // 2. TPX map — get store_type for each order
+    console.log("[SO Stage] Step 2 — Building TPX map...");
     const tpx_cursor = (await getDb("tpx_orders")).collection("tpx_orders").find(
         { $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }] },
-        { projection: { txn_id: 1, to: 1 } }
+        { projection: { txn_id: 1, store_type: 1 } }
     );
-    const tpxMap = new Map<string, any>();
+    const tpxMap = new Map<string, { store_type: string }>();
     for await (const tpx of tpx_cursor) {
-        if (tpx?.txn_id) tpxMap.set(tpx.txn_id, tpx.to);
+        if (tpx?.txn_id) tpxMap.set(tpx.txn_id, { store_type: tpx.store_type || "" });
     }
     console.log(`[SO Stage] TPX map: ${tpxMap.size} entries`);
 
-    // 3️⃣ SKU → vendor map
+    // 3. SKU → vendor map
     console.log("[SO Stage] Step 3 — Building SKU→vendor map...");
     const ns_db = await getDb("netsuite");
     const suite_cursor = ns_db.collection("suite_list").find({}, { projection: { vendorname: 1, vendor: 1 } });
@@ -71,7 +70,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
     }
     console.log(`[SO Stage] SKU→vendor map: ${skuVendorMap.size} entries`);
 
-    // 4️⃣ PO map
+    // 4. PO map
     console.log("[SO Stage] Step 4 — Building PO map...");
     const po_cursor = (await getDb("ebp_pomanager")).collection("po_management").find({
         created_at: { $gt: DATE_FILTER_SQL }
@@ -91,31 +90,24 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
 
     console.log(`[SO Stage] PO map: ${po_map.size} order IDs`);
 
-    // 5️⃣ Build sales orders
+    // 5. Build sales orders
     console.log("[SO Stage] Step 5 — Building sales orders...");
     const sales_orders: SalesOrder[] = [];
     for await (const order of amazon_cursor) {
         const orderId = order?.AmazonOrderId;
         if (!orderId) continue;
 
-        const tpxAddress = tpxMap.get(orderId);
-        const location = [tpxAddress?.Street, tpxAddress?.City, tpxAddress?.State, tpxAddress?.ZipCode]
-            .filter(Boolean).map((v: string) => v.trim().toUpperCase()).join(", ");
-
-        const shipFrom = order.DefaultShipFromLocationAddress;
-        const ship_from = [shipFrom?.AddressLine1, shipFrom?.City, shipFrom?.StateOrRegion, shipFrom?.PostalCode]
-            .filter(Boolean).map((v: string) => String(v).trim().toUpperCase()).join(", ");
+        const tpxData = tpxMap.get(orderId);
 
         sales_orders.push({
             otherrefnum:        orderId,
             trandate:           new Date(order.PurchaseDate),
+            store_type:         tpxData?.store_type || "amazon",
             order_status:       order.OrderStatus || "",
             fulfillment_channel: order.FulfillmentChannel || "",
             ship_date:          order.LatestShipDate || null,
             items_shipped:      Number(order.NumberOfItemsShipped || 0),
             items_unshipped:    Number(order.NumberOfItemsUnshipped || 0),
-            location,
-            ship_from,
             items: (order.OrderItems || []).map((i: any) => ({
                 item:     i?.SellerSKU,
                 quantity: Number(i?.QuantityOrdered || 0),
@@ -125,7 +117,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         });
     }
 
-    // 6️⃣ Upsert into netsuite.suite_sales_order (staging)
+    // 6. Upsert into netsuite.suite_sales_order (staging)
     console.log(`[SO Stage] Step 6 — Upserting ${sales_orders.length} sales orders...`);
     if (sales_orders.length > 0) {
         await ns_db.collection<SalesOrder>("suite_sales_order").bulkWrite(

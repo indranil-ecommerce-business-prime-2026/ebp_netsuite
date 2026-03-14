@@ -12,11 +12,6 @@
  * 8. Deployment ID: customdeploy_ebp_po_sync
  * 9. Status: Released
  *
- * NOTE: This RESTlet shares the same URL pattern as the Sales Order RESTlet
- * but uses record_type = "purchaseorder" in the payload to differentiate.
- * You can deploy both as separate scripts, OR merge into one RESTlet that
- * routes by record_type.
- *
  * PAYLOAD EXPECTED:
  * {
  *   action:                   "skip" | "update",
@@ -37,38 +32,38 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/record", "N/search", "N/log"], (record, search, log) => {
+define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
-    const post = (payload) => {
+    function post(payload) {
         try {
-            const {
-                action,
-                po_number,
-                otherrefnum,
-                vendor_id,
-                distributor,
-                distributor_order_number,
-                status,
-                invoice,
-                tracking,
-                website_order_number,
-                order_items
-            } = payload;
+            log.debug("PAYLOAD", JSON.stringify(payload));
+
+            var action                   = payload.action || "skip";
+            var po_number                = payload.po_number;
+            var otherrefnum              = payload.otherrefnum;
+            var vendor_id                = payload.vendor_id;
+            var distributor              = payload.distributor || "";
+            var distributor_order_number = payload.distributor_order_number || "";
+            var status                   = payload.status || "";
+            var invoice                  = payload.invoice;
+            var tracking                 = payload.tracking;
+            var website_order_number     = payload.website_order_number || "";
+            var order_items              = payload.order_items;
 
             if (!po_number) {
                 return { success: false, error: "Missing po_number" };
             }
 
             // ── Check if PO already exists in NetSuite ───────────────────────
-            const existingId = findPurchaseOrder(otherrefnum, search);
+            var existingId = findPurchaseOrder(String(otherrefnum || po_number));
 
             if (existingId && action === "skip") {
-                log.debug("SKIP", `PO ${po_number} already exists. Skipping.`);
-                return { success: true, action: "skipped", po_number };
+                log.debug("SKIP", "PO " + po_number + " already exists. Skipping.");
+                return { success: true, action: "skipped", po_number: po_number };
             }
 
             // ── Build record ─────────────────────────────────────────────────
-            let po;
+            var po;
 
             if (existingId && action === "update") {
                 po = record.load({ type: record.Type.PURCHASE_ORDER, id: existingId, isDynamic: true });
@@ -76,75 +71,138 @@ define(["N/record", "N/search", "N/log"], (record, search, log) => {
                 po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
             }
 
+            // ── Vendor (required for Purchase Order) — set FIRST for sourcing
+            if (vendor_id) {
+                po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+            }
+
+            var poSubsidiary = "";
+            try { poSubsidiary = po.getValue({ fieldId: "subsidiary" }); } catch (e) {}
+            log.debug("ENTITY_SET", JSON.stringify({
+                vendor: vendor_id,
+                subsidiary: poSubsidiary,
+                form: po.getValue({ fieldId: "customform" })
+            }));
+
             // ── Standard fields ──────────────────────────────────────────────
             po.setValue({ fieldId: "otherrefnum", value: String(po_number) });
             po.setValue({ fieldId: "trandate",    value: new Date() });
-            po.setValue({ fieldId: "memo",        value: website_order_number || "" });
+            po.setValue({ fieldId: "memo",        value: website_order_number });
 
-            // ── Vendor (required for Purchase Order) ─────────────────────────
-            if (vendor_id) {
-                po.setValue({ fieldId: "entity", value: vendor_id });
+            // ── Custom fields — wrapped in try/catch ─────────────────────────
+            try { po.setValue({ fieldId: "custbody2", value: String(distributor_order_number || po_number) }); } catch (e) {
+                log.debug("FIELD_SKIP", "custbody2: " + e.message);
+            }
+            try { po.setValue({ fieldId: "custbody1", value: status }); } catch (e) {
+                log.debug("FIELD_SKIP", "custbody1: " + e.message);
             }
 
-            // ── Existing custom fields (from TransactionBodyFields export) ───
-            po.setValue({ fieldId: "custbody2", value: String(distributor_order_number || po_number) }); // "Disti PO Number"
-            po.setValue({ fieldId: "custbody1", value: status || "" });                                  // "Shipping Status"
-
-            // ── Distributor name → custbody_otherrefnumber_custom ("PO#") ───
+            // custbody_otherrefnumber_custom — only set if it exists on PO form
             if (distributor) {
-                po.setValue({ fieldId: "custbody_otherrefnumber_custom", value: String(distributor) });
+                try { po.setValue({ fieldId: "custbody_otherrefnumber_custom", value: String(distributor) }); } catch (e) {
+                    log.debug("FIELD_SKIP", "custbody_otherrefnumber_custom: " + e.message);
+                }
             }
 
-            // ── Invoice reference (first invoice entry if array) ─────────────
+            // ── Invoice reference ──────────────────────────────────────────────
             if (Array.isArray(invoice) && invoice.length > 0) {
-                po.setValue({ fieldId: "memo", value: `${website_order_number || ""} | INV: ${invoice[0]}` });
+                po.setValue({ fieldId: "memo", value: website_order_number + " | INV: " + invoice[0] });
             }
 
-            // ── Tracking ─────────────────────────────────────────────────────
-            // custbody_ebp_tracking — create this field in NetSuite if needed
-            // Go to: Customization → Lists, Records & Fields → Transaction Body Fields → New
-            //   Label: Tracking Number | ID: custbody_ebp_tracking | Type: Free-Form Text | Applies to: Purchase
-            // Once created, uncomment:
-            // if (tracking) po.setValue({ fieldId: "custbody_ebp_tracking", value: tracking });
+            // ── Remove any pre-populated/default line items ─────────────────
+            var existingLines = po.getLineCount({ sublistId: "item" });
+            for (var r = existingLines - 1; r >= 0; r--) {
+                po.removeLine({ sublistId: "item", line: r });
+            }
 
             // ── Line items ───────────────────────────────────────────────────
-            if (Array.isArray(order_items)) {
-                order_items.forEach((item) => {
-                    po.selectNewLine({ sublistId: "item" });
-                    po.setCurrentSublistValue({ sublistId: "item", fieldId: "item",     value: item.sku });
-                    po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: Number(item.qty || 0) });
-                    po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate",     value: Number(item.cost || 0) });
-                    po.commitLine({ sublistId: "item" });
-                });
+            var linesAdded = 0;
+            var skippedSkus = [];
+
+            if (Array.isArray(order_items) && order_items.length > 0) {
+                for (var i = 0; i < order_items.length; i++) {
+                    var lineItem = order_items[i];
+                    var sku = lineItem.sku;
+                    if (!sku) continue;
+
+                    try {
+                        // Look up item by SKU → get internal ID
+                        var itemCol = search.createColumn({ name: "internalid" });
+                        var typeCol = search.createColumn({ name: "type" });
+                        var itemResults = search.create({
+                            type: search.Type.ITEM,
+                            filters: [["itemid", "is", sku]],
+                            columns: [itemCol, typeCol]
+                        }).run().getRange({ start: 0, end: 1 });
+
+                        if (!itemResults || itemResults.length === 0) {
+                            log.debug("ITEM_NOT_FOUND", "SKU \"" + sku + "\" not in NetSuite");
+                            skippedSkus.push(sku);
+                            continue;
+                        }
+
+                        var itemInternalId = parseInt(itemResults[0].getValue(itemCol), 10);
+                        var itemType = itemResults[0].getText(typeCol) || itemResults[0].getValue(typeCol);
+                        log.debug("ITEM_FOUND", "SKU \"" + sku + "\" → ID " + itemInternalId + ", type: " + itemType);
+
+                        var qty = parseInt(lineItem.qty, 10) || 1;
+                        var cost = parseFloat(lineItem.cost) || 0;
+
+                        po.selectNewLine({ sublistId: "item" });
+                        po.setCurrentSublistValue({
+                            sublistId: "item", fieldId: "item",
+                            value: itemInternalId, ignoreFieldChange: false
+                        });
+                        po.setCurrentSublistValue({
+                            sublistId: "item", fieldId: "quantity",
+                            value: qty, ignoreFieldChange: false
+                        });
+                        po.setCurrentSublistValue({
+                            sublistId: "item", fieldId: "rate",
+                            value: cost, ignoreFieldChange: false
+                        });
+                        po.commitLine({ sublistId: "item" });
+
+                        linesAdded++;
+                        log.debug("ITEM_ADDED", "SKU \"" + sku + "\" → lines now: " + po.getLineCount({ sublistId: "item" }));
+                    } catch (lineErr) {
+                        log.error("ITEM_SKIP", "SKU \"" + sku + "\" — " + lineErr.message);
+                        skippedSkus.push(sku);
+                    }
+                }
             }
 
-            const savedId = po.save();
+            if (linesAdded === 0) {
+                var skuList = Array.isArray(order_items) ? order_items.map(function (x) { return x.sku; }).join(", ") : "none";
+                return { success: false, action: "no_items", po_number: po_number, skus: skuList, skipped: skippedSkus };
+            }
 
-            log.debug("SUCCESS", `PO ${po_number} saved with internal ID: ${savedId}`);
+            var savedId = po.save({ enableSourcing: true, ignoreMandatoryFields: true });
+            log.debug("SUCCESS", "PO " + po_number + " saved → ID: " + savedId);
 
             return {
                 success: true,
                 action: existingId ? "updated" : "created",
-                po_number,
+                po_number: po_number,
                 internalId: savedId
             };
 
         } catch (e) {
-            log.error("ERROR", e.message);
+            log.error("ERROR", JSON.stringify({ name: e.name, message: e.message, stack: e.stack }));
             return { success: false, error: e.message };
         }
-    };
+    }
 
     // ── Helper: find existing PO by otherrefnum ──────────────────────────────
-    const findPurchaseOrder = (otherrefnum, search) => {
-        const results = search.create({
+    function findPurchaseOrder(otherrefnum) {
+        var results = search.create({
             type: search.Type.PURCHASE_ORDER,
             filters: [["otherrefnum", "is", otherrefnum]],
             columns: ["internalid"]
         }).run().getRange({ start: 0, end: 1 });
 
-        return results.length > 0 ? results[0].getValue("internalid") : null;
-    };
+        return results.length > 0 ? parseInt(results[0].getValue("internalid"), 10) : null;
+    }
 
-    return { post };
+    return { post: post };
 });
