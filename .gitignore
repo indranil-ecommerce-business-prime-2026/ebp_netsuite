@@ -2,3 +2,5 @@ node_modules
 exports
 logs
 .env
+env
+schemas/*
