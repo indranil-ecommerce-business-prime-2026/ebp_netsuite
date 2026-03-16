@@ -95,10 +95,10 @@ cron.schedule("*/30 * * * *", async () => {
 });
 
 // ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
-cron.schedule("*/30 * * * *", async () => {
-    console.log("[CRON] [PO] Step 1 — Staging purchase orders (shipped / invoiced)...");
-    await stagePurchaseOrders();
+// cron.schedule("*/30 * * * *", async () => {
+//     console.log("[CRON] [PO] Step 1 — Staging purchase orders (shipped / invoiced)...");
+//     await stagePurchaseOrders();
 
-    console.log("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-    await syncPurchaseOrdersToNetsuite();
-});
+//     console.log("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+//     await syncPurchaseOrdersToNetsuite();
+// });
