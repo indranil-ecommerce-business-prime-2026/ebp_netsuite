@@ -15,7 +15,8 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
         ? { ns_failed: { $ne: true } }
         : { ns_synced: { $ne: true }, ns_failed: { $ne: true } };
 
-    const orders = await collection.find(filter).toArray();
+    const BATCH_LIMIT = 200;
+    const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
 
     if (orders.length === 0) {
         console.log("[NS Sync] No orders to process. Skipping.");

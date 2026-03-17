@@ -34,7 +34,58 @@
  */
 define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
+    // ── Snapshot helpers (mirror SO RESTlet pattern) ─────────────────────
+    function snapshotPO(poRecord) {
+        var snap = { header: {}, lines: [] };
+        var headerFields = [
+            "customform", "entity", "subsidiary", "otherrefnum",
+            "trandate", "memo", "currency", "custbody1", "custbody2",
+            "custbody_otherrefnumber_custom"
+        ];
+        for (var hi = 0; hi < headerFields.length; hi++) {
+            try {
+                snap.header[headerFields[hi]] = poRecord.getValue({ fieldId: headerFields[hi] });
+            } catch (e) {}
+        }
+        var lineCount = poRecord.getLineCount({ sublistId: "item" });
+        snap.header.lineCount = lineCount;
+
+        var lineFields = ["item", "quantity", "rate", "amount", "location", "description"];
+        for (var li = 0; li < lineCount; li++) {
+            var line = { line: li };
+            for (var lf = 0; lf < lineFields.length; lf++) {
+                try {
+                    line[lineFields[lf]] = poRecord.getSublistValue({
+                        sublistId: "item", fieldId: lineFields[lf], line: li
+                    });
+                } catch (e) {}
+            }
+            snap.lines.push(line);
+        }
+        return snap;
+    }
+
+    function diffSnapshots(before, after) {
+        var changes = { header: {}, lines: {} };
+        for (var key in after.header) {
+            if (String(before.header[key]) !== String(after.header[key])) {
+                changes.header[key] = { from: before.header[key], to: after.header[key] };
+            }
+        }
+        if (before.header.lineCount !== after.header.lineCount) {
+            changes.lines.countChange = {
+                from: before.header.lineCount,
+                to: after.header.lineCount
+            };
+        }
+        return changes;
+    }
+
     function post(payload) {
+        var before = null;
+        var after = null;
+        var diff = null;
+
         try {
             log.debug("PAYLOAD", JSON.stringify(payload));
 
@@ -55,18 +106,20 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             }
 
             // ── Check if PO already exists in NetSuite ───────────────────────
-            var existingId = findPurchaseOrder(String(otherrefnum || po_number));
+            var existing = findPurchaseOrder(String(otherrefnum || po_number));
 
-            if (existingId && action === "skip") {
-                log.debug("SKIP", "PO " + po_number + " already exists. Skipping.");
-                return { success: true, action: "skipped", po_number: po_number };
+            if (existing && action === "skip") {
+                log.debug("SKIP", "PO " + po_number + " already exists (ID " + existing.id + "). Skipping.");
+                return { success: true, action: "skipped", po_number: po_number, internalId: existing.id, poNumber: existing.poNumber };
             }
 
             // ── Build record ─────────────────────────────────────────────────
             var po;
+            var isUpdate = false;
 
-            if (existingId && action === "update") {
-                po = record.load({ type: record.Type.PURCHASE_ORDER, id: existingId, isDynamic: true });
+            if (existing && action === "update") {
+                po = record.load({ type: record.Type.PURCHASE_ORDER, id: existing.id, isDynamic: true });
+                isUpdate = true;
             } else {
                 po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
             }
@@ -109,13 +162,11 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 po.setValue({ fieldId: "memo", value: website_order_number + " | INV: " + invoice[0] });
             }
 
-            // ── Remove any pre-populated/default line items ─────────────────
-            var existingLines = po.getLineCount({ sublistId: "item" });
-            for (var r = existingLines - 1; r >= 0; r--) {
-                po.removeLine({ sublistId: "item", line: r });
-            }
+            // ── SNAPSHOT: BEFORE (after header set, before line changes) ────
+            before = snapshotPO(po);
 
-            // ── Line items ───────────────────────────────────────────────────
+            // ── Line items — add-first, remove-old strategy ──────────────────
+            var oldLineCount = po.getLineCount({ sublistId: "item" });
             var linesAdded = 0;
             var skippedSkus = [];
 
@@ -143,6 +194,14 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
                         var itemInternalId = parseInt(itemResults[0].getValue(itemCol), 10);
                         var itemType = itemResults[0].getText(typeCol) || itemResults[0].getValue(typeCol);
+
+                        // Skip Group/Kit types
+                        if (itemType === "Group" || itemType === "Kit" || itemType === "Kit/Package") {
+                            log.debug("ITEM_SKIP_TYPE", "SKU \"" + sku + "\" is " + itemType + " — skipping");
+                            skippedSkus.push(sku + " (type:" + itemType + ")");
+                            continue;
+                        }
+
                         log.debug("ITEM_FOUND", "SKU \"" + sku + "\" → ID " + itemInternalId + ", type: " + itemType);
 
                         var qty = parseInt(lineItem.qty, 10) || 1;
@@ -172,36 +231,89 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 }
             }
 
-            if (linesAdded === 0) {
-                var skuList = Array.isArray(order_items) ? order_items.map(function (x) { return x.sku; }).join(", ") : "none";
-                return { success: false, action: "no_items", po_number: po_number, skus: skuList, skipped: skippedSkus };
+            // Step 2: REMOVE old lines in reverse order (add-first, remove-old)
+            if (oldLineCount > 0 && linesAdded > 0) {
+                log.debug("REMOVE_OLD", "Removing " + oldLineCount + " old lines (new added: " + linesAdded + ")");
+                for (var r = oldLineCount - 1; r >= 0; r--) {
+                    po.removeLine({ sublistId: "item", line: r });
+                }
+            } else if (oldLineCount > 0 && linesAdded === 0) {
+                // No new lines added — remove old lines anyway (will fail at save if 0 lines)
+                for (var r2 = oldLineCount - 1; r2 >= 0; r2--) {
+                    po.removeLine({ sublistId: "item", line: r2 });
+                }
             }
+
+            // ── No items to sync? ─────────────────────────────────────────────
+            if (linesAdded === 0) {
+                after = snapshotPO(po);
+                diff = diffSnapshots(before, after);
+                var skuList = Array.isArray(order_items) ? order_items.map(function (x) { return x.sku; }).join(", ") : "none";
+                return {
+                    success: true,
+                    action: "no_items",
+                    po_number: po_number,
+                    skus: skuList,
+                    skipped: skippedSkus,
+                    before: before, after: after, diff: diff
+                };
+            }
+
+            // ── SNAPSHOT: AFTER (before save) ──────────────────────────────────
+            after = snapshotPO(po);
+            diff = diffSnapshots(before, after);
 
             var savedId = po.save({ enableSourcing: true, ignoreMandatoryFields: true });
             log.debug("SUCCESS", "PO " + po_number + " saved → ID: " + savedId);
 
             return {
                 success: true,
-                action: existingId ? "updated" : "created",
+                action: isUpdate ? "updated" : "created",
                 po_number: po_number,
-                internalId: savedId
+                internalId: savedId,
+                linesAdded: linesAdded,
+                skippedSkus: skippedSkus.length > 0 ? skippedSkus : undefined,
+                before: before, after: after, diff: diff
             };
 
         } catch (e) {
             log.error("ERROR", JSON.stringify({ name: e.name, message: e.message, stack: e.stack }));
-            return { success: false, error: e.message };
+            return {
+                success: false,
+                error: e.message,
+                po_number: payload ? payload.po_number : null,
+                before: before, after: after, diff: diff
+            };
         }
     }
 
     // ── Helper: find existing PO by otherrefnum ──────────────────────────────
+    // Sorts by internalid DESC → picks newest if duplicates exist
     function findPurchaseOrder(otherrefnum) {
+        var idCol = search.createColumn({ name: "internalid", sort: search.Sort.DESC });
+        var tranCol = search.createColumn({ name: "tranid" });
+
         var results = search.create({
             type: search.Type.PURCHASE_ORDER,
-            filters: [["otherrefnum", "is", otherrefnum]],
-            columns: ["internalid"]
-        }).run().getRange({ start: 0, end: 1 });
+            filters: [
+                ["otherrefnum", "is", otherrefnum],
+                "AND",
+                ["mainline", "is", "T"]
+            ],
+            columns: [idCol, tranCol]
+        }).run().getRange({ start: 0, end: 10 });
 
-        return results.length > 0 ? parseInt(results[0].getValue("internalid"), 10) : null;
+        if (results.length === 0) return null;
+
+        if (results.length > 1) {
+            log.audit("PO_DUPLICATES", "Found " + results.length +
+                " POs for otherrefnum " + otherrefnum + " -- using newest (highest ID)");
+        }
+
+        return {
+            id: parseInt(results[0].getValue(idCol), 10),
+            poNumber: results[0].getValue(tranCol)
+        };
     }
 
     return { post: post };

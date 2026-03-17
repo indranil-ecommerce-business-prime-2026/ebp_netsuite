@@ -38,7 +38,7 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/search", "N/record", "N/runtime", "N/log"], function (search, record, runtime, log) {
+define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (search, record, runtime, log, query) {
 
     function post(payload) {
         var sections = (payload && payload.sections) || ["all"];
@@ -543,6 +543,1096 @@ define(["N/search", "N/record", "N/runtime", "N/log"], function (search, record,
             }
         }
 
+        // ── Delete Sales Orders (Pending Fulfillment only) ────────────────
+        // POST: { "sections": ["delete_all_so"] }                              → dry-run (count only)
+        // POST: { "sections": ["delete_all_so"], "confirm": true }             → delete batch of 200
+        // POST: { "sections": ["delete_all_so"], "confirm": true, "batch_size": 500 }
+        // Only deletes SOs with status = "Pending Fulfillment" (SalesOrd:B).
+        // Governance: record.delete = 20 units. RESTlet cap = 10,000 units.
+        // Max ~500 deletes per call. Call repeatedly until remaining = 0.
+        if (sections.indexOf("delete_all_so") >= 0) {
+            var delFilters = [
+                ["mainline", "is", "T"],
+                "AND",
+                ["status", "anyof", "SalesOrd:B"]
+            ];
+
+            if (!payload.confirm) {
+                // Dry-run: just count how many matching SOs exist
+                try {
+                    var countSearch = search.create({
+                        type: search.Type.SALES_ORDER,
+                        filters: delFilters,
+                        columns: [search.createColumn({ name: "internalid" })]
+                    });
+                    var totalCount = 0;
+                    countSearch.runPaged({ pageSize: 1000 }).pageRanges.forEach(function (pr) {
+                        totalCount += countSearch.runPaged({ pageSize: 1000 }).fetch({ index: pr.index }).data.length;
+                    });
+                    result.delete_all_so = {
+                        mode: "dry_run",
+                        status_filter: "Pending Fulfillment",
+                        total_sales_orders: totalCount,
+                        message: "Pass { \"confirm\": true } to actually delete. Will delete in batches."
+                    };
+                } catch (e) { result.delete_all_so = { error: e.message }; }
+            } else {
+                // Actual delete
+                var batchSize = parseInt(payload.batch_size, 10) || 200;
+                if (batchSize > 500) batchSize = 500; // governance safety cap
+                try {
+                    var delIdCol = search.createColumn({ name: "internalid" });
+                    var delTranCol = search.createColumn({ name: "tranid" });
+                    var delPoCol = search.createColumn({ name: "otherrefnum" });
+                    var delStatusCol = search.createColumn({ name: "status" });
+
+                    var delResults = search.create({
+                        type: search.Type.SALES_ORDER,
+                        filters: delFilters,
+                        columns: [delIdCol, delTranCol, delPoCol, delStatusCol]
+                    }).run().getRange({ start: 0, end: batchSize });
+
+                    var deleted = [];
+                    var failed = [];
+
+                    for (var di = 0; di < delResults.length; di++) {
+                        var delId = delResults[di].getValue(delIdCol);
+                        var delTran = delResults[di].getValue(delTranCol);
+                        var delPo = delResults[di].getValue(delPoCol);
+                        try {
+                            record.delete({ type: record.Type.SALES_ORDER, id: parseInt(delId, 10) });
+                            deleted.push({ id: delId, soNumber: delTran, po: delPo });
+                            log.audit("SO_DELETED", "Deleted SO ID " + delId + " (" + delTran + ")");
+                        } catch (delErr) {
+                            failed.push({ id: delId, soNumber: delTran, po: delPo, error: delErr.message });
+                            log.error("SO_DELETE_FAIL", "ID " + delId + " — " + delErr.message);
+                        }
+                    }
+
+                    // Check how many matching SOs remain
+                    var remaining = 0;
+                    try {
+                        remaining = search.create({
+                            type: search.Type.SALES_ORDER,
+                            filters: delFilters,
+                            columns: [search.createColumn({ name: "internalid" })]
+                        }).runPaged({ pageSize: 1000 }).count;
+                    } catch (e) {}
+
+                    result.delete_all_so = {
+                        mode: "executed",
+                        status_filter: "Pending Fulfillment",
+                        batch_size: batchSize,
+                        found_in_batch: delResults.length,
+                        deleted_count: deleted.length,
+                        failed_count: failed.length,
+                        remaining: remaining,
+                        deleted: deleted,
+                        failed: failed.length > 0 ? failed : undefined,
+                        done: remaining === 0,
+                        message: remaining > 0 ? "Call again — " + remaining + " Pending Fulfillment SOs remaining." : "All Pending Fulfillment Sales Orders deleted."
+                    };
+                } catch (e) { result.delete_all_so = { error: e.message }; }
+            }
+        }
+
+        // ── Fetch All Purchase Orders (paginated, with line items) ────────────
+        // POST: { "sections": ["fetch_all_po"], "page": 0, "pageSize": 200 }
+        // Returns PO headers + their line items per page.
+        // Call repeatedly incrementing page until done === true.
+        if (sections.indexOf("fetch_all_po") >= 0) {
+            var fapPage = parseInt(payload.page, 10) || 0;
+            var fapPageSize = parseInt(payload.pageSize, 10) || 200;
+            if (fapPageSize > 1000) fapPageSize = 1000;
+
+            try {
+                // ── Step 1: PO headers (mainline=T) ──────────────────────────
+                var fapHeaderNames = [
+                    "internalid", "tranid", "otherrefnum", "entity",
+                    "trandate", "status", "memo", "customform", "subsidiary"
+                ];
+                var fapCustomBodyNames = ["custbody1", "custbody2"];
+                var fapTextCols = ["entity", "status", "customform", "subsidiary"];
+
+                var fapAllHeaderNames = fapHeaderNames;
+                var fapHasCustom = true;
+
+                // Try adding custom body fields
+                try {
+                    var testCols = fapHeaderNames.concat(fapCustomBodyNames).map(function (n) {
+                        return search.createColumn({ name: n });
+                    });
+                    search.create({
+                        type: search.Type.PURCHASE_ORDER,
+                        filters: [["mainline", "is", "T"]],
+                        columns: testCols
+                    }).run().getRange({ start: 0, end: 1 });
+                    fapAllHeaderNames = fapHeaderNames.concat(fapCustomBodyNames);
+                } catch (cbErr) {
+                    log.audit("FAP_FALLBACK", "Custom body fields unavailable: " + cbErr.message);
+                    fapHasCustom = false;
+                }
+
+                var fapHeaderCols = fapAllHeaderNames.map(function (n) {
+                    return search.createColumn({ name: n });
+                });
+
+                var fapHeaderSearch = search.create({
+                    type: search.Type.PURCHASE_ORDER,
+                    filters: [["mainline", "is", "T"]],
+                    columns: fapHeaderCols
+                });
+
+                var fapPaged = fapHeaderSearch.runPaged({ pageSize: fapPageSize });
+                var fapTotal = fapPaged.count;
+                var fapTotalPages = fapPaged.pageRanges.length;
+
+                if (fapTotal === 0 || fapPage >= fapTotalPages) {
+                    result.fetch_all_po = {
+                        page: fapPage, pageSize: fapPageSize,
+                        total: fapTotal, totalPages: fapTotalPages,
+                        count: 0, purchase_orders: [], done: true,
+                        hasCustomFields: fapHasCustom
+                    };
+                } else {
+                    var fapHeaders = [];
+                    var fapPoIds = [];
+                    var fapPageData = fapPaged.fetch({ index: fapPage });
+
+                    fapPageData.data.forEach(function (r) {
+                        var po = {};
+                        for (var fi = 0; fi < fapAllHeaderNames.length; fi++) {
+                            try {
+                                po[fapAllHeaderNames[fi]] = r.getValue(fapHeaderCols[fi]);
+                                if (fapTextCols.indexOf(fapAllHeaderNames[fi]) >= 0) {
+                                    var ftxt = r.getText(fapHeaderCols[fi]);
+                                    if (ftxt) po[fapAllHeaderNames[fi] + "_text"] = ftxt;
+                                }
+                            } catch (fErr) {
+                                po[fapAllHeaderNames[fi]] = null;
+                            }
+                        }
+                        po.line_items = [];
+                        fapHeaders.push(po);
+                        fapPoIds.push(r.getValue("internalid"));
+                    });
+
+                    // ── Step 2: Line items for these POs (mainline=F) ────────
+                    if (fapPoIds.length > 0) {
+                        try {
+                            var fapLineNames = ["internalid", "item", "quantity", "rate", "amount"];
+                            var fapLineTextCols = ["item"];
+                            var fapLineCols = fapLineNames.map(function (n) {
+                                return search.createColumn({ name: n });
+                            });
+
+                            var fapLineSearch = search.create({
+                                type: search.Type.PURCHASE_ORDER,
+                                filters: [
+                                    ["mainline", "is", "F"],
+                                    "AND",
+                                    ["internalid", "anyof", fapPoIds],
+                                    "AND",
+                                    ["item.type", "noneof", "@NONE@"]
+                                ],
+                                columns: fapLineCols
+                            });
+
+                            // Build a map: poId → [lines]
+                            var fapLineMap = {};
+                            var fapLinePagedData = fapLineSearch.runPaged({ pageSize: 1000 });
+                            fapLinePagedData.pageRanges.forEach(function (pr) {
+                                fapLinePagedData.fetch({ index: pr.index }).data.forEach(function (lr) {
+                                    var poId = lr.getValue("internalid");
+                                    var line = {};
+                                    for (var li = 0; li < fapLineNames.length; li++) {
+                                        try {
+                                            line[fapLineNames[li]] = lr.getValue(fapLineCols[li]);
+                                            if (fapLineTextCols.indexOf(fapLineNames[li]) >= 0) {
+                                                var ltxt = lr.getText(fapLineCols[li]);
+                                                if (ltxt) line[fapLineNames[li] + "_text"] = ltxt;
+                                            }
+                                        } catch (le) {
+                                            line[fapLineNames[li]] = null;
+                                        }
+                                    }
+                                    if (!fapLineMap[poId]) fapLineMap[poId] = [];
+                                    fapLineMap[poId].push(line);
+                                });
+                            });
+
+                            // Attach lines to their PO headers
+                            for (var pi = 0; pi < fapHeaders.length; pi++) {
+                                var hdrId = fapHeaders[pi].internalid;
+                                fapHeaders[pi].line_items = fapLineMap[hdrId] || [];
+                            }
+                        } catch (lineErr) {
+                            log.error("FAP_LINE_ERR", lineErr.message);
+                            // Headers still returned, just without lines
+                        }
+                    }
+
+                    result.fetch_all_po = {
+                        page: fapPage, pageSize: fapPageSize,
+                        total: fapTotal, totalPages: fapTotalPages,
+                        count: fapHeaders.length,
+                        purchase_orders: fapHeaders,
+                        done: fapPage >= fapTotalPages - 1,
+                        hasCustomFields: fapHasCustom
+                    };
+                }
+            } catch (e) {
+                result.fetch_all_po = { error: e.message };
+            }
+        }
+
+        // ── Fetch All Items (paginated) ─────────────────────────────────────
+        // POST: { "sections": ["fetch_all_items"], "page": 0, "pageSize": 500 }
+        // Returns all active items with core + custom fields, paginated.
+        // Call repeatedly incrementing page until done === true.
+        if (sections.indexOf("fetch_all_items") >= 0) {
+            var faiPage = parseInt(payload.page, 10) || 0;
+            var faiPageSize = parseInt(payload.pageSize, 10) || 500;
+            if (faiPageSize > 1000) faiPageSize = 1000;
+
+            try {
+                var faiCoreNames = [
+                    "internalid", "itemid", "displayname", "upccode",
+                    "type", "baseprice", "cost", "vendor", "class"
+                ];
+                var faiCustomNames = [
+                    "custitem1", "custitem2", "custitem3", "custitem17",
+                    "custitem36", "custitem38", "custitem39", "custitem40",
+                    "custitem22", "custitem23", "custitem24", "custitem25",
+                    "custitem27", "custitem28",
+                    "custitem29", "custitem30", "custitem31", "custitem32",
+                    "custitem33", "custitem34", "custitem35",
+                    "custitem18", "custitem19", "custitem20", "custitem21"
+                ];
+                var faiTextCols = ["type", "vendor", "class"];
+
+                // Try all columns; fall back to core-only if custom fields fail
+                var faiColNames;
+                var faiHasCustom = true;
+                var faiColumns;
+
+                try {
+                    faiColNames = faiCoreNames.concat(faiCustomNames);
+                    faiColumns = faiColNames.map(function (n) { return search.createColumn({ name: n }); });
+                    // Test the search to confirm columns are valid
+                    search.create({
+                        type: search.Type.ITEM,
+                        filters: [["isinactive", "is", "F"]],
+                        columns: faiColumns
+                    }).run().getRange({ start: 0, end: 1 });
+                } catch (colErr) {
+                    log.audit("FAI_FALLBACK", "Custom fields unavailable: " + colErr.message);
+                    faiHasCustom = false;
+                    faiColNames = faiCoreNames;
+                    faiColumns = faiColNames.map(function (n) { return search.createColumn({ name: n }); });
+                }
+
+                var faiSearch = search.create({
+                    type: search.Type.ITEM,
+                    filters: [["isinactive", "is", "F"]],
+                    columns: faiColumns
+                });
+
+                var faiPaged = faiSearch.runPaged({ pageSize: faiPageSize });
+                var faiTotal = faiPaged.count;
+                var faiTotalPages = faiPaged.pageRanges.length;
+
+                if (faiTotal === 0 || faiPage >= faiTotalPages) {
+                    result.fetch_all_items = {
+                        page: faiPage, pageSize: faiPageSize,
+                        total: faiTotal, totalPages: faiTotalPages,
+                        count: 0, items: [], done: true,
+                        hasCustomFields: faiHasCustom
+                    };
+                } else {
+                    var faiItems = [];
+                    var faiPageData = faiPaged.fetch({ index: faiPage });
+
+                    faiPageData.data.forEach(function (r) {
+                        var item = {};
+                        for (var fi = 0; fi < faiColNames.length; fi++) {
+                            try {
+                                item[faiColNames[fi]] = r.getValue(faiColumns[fi]);
+                                if (faiTextCols.indexOf(faiColNames[fi]) >= 0) {
+                                    var ftxt = r.getText(faiColumns[fi]);
+                                    if (ftxt) item[faiColNames[fi] + "_text"] = ftxt;
+                                }
+                            } catch (fErr) {
+                                item[faiColNames[fi]] = null;
+                            }
+                        }
+                        faiItems.push(item);
+                    });
+
+                    result.fetch_all_items = {
+                        page: faiPage, pageSize: faiPageSize,
+                        total: faiTotal, totalPages: faiTotalPages,
+                        count: faiItems.length, items: faiItems,
+                        done: faiPage >= faiTotalPages - 1,
+                        hasCustomFields: faiHasCustom
+                    };
+                }
+            } catch (e) {
+                result.fetch_all_items = { error: e.message };
+            }
+        }
+
+        // ── Fetch All Items FULL (raw NetSuite field names, expanded) ──────────
+        // POST: { "sections": ["fetch_all_items_full"], "page": 0, "pageSize": 500 }
+        // Returns ALL available fields with original NetSuite field IDs.
+        // Includes: Primary Info, Item Detail, Item/Cost Detail, Manufacturing,
+        //           TD Synnex, D&H, Ingram Micro, Distribution Mgmt, NewAge tabs
+        if (sections.indexOf("fetch_all_items_full") >= 0) {
+            var fifPage = parseInt(payload.page, 10) || 0;
+            var fifPageSize = parseInt(payload.pageSize, 10) || 500;
+            if (fifPageSize > 1000) fifPageSize = 1000;
+
+            try {
+                // ── Key format: "human_readable-internal_id" ──
+                // Standard fields: key = internal ID (already readable)
+                // Custom fields:   key = "description-custitemN" so you get both meaning + ID in one key
+                var fifFieldMap = {
+                    // Primary Information
+                    "internalid": "internalid",
+                    "externalid": "externalid",
+                    "itemid": "itemid",
+                    "displayname": "displayname",
+                    "vendorname": "vendorname",
+                    "parent": "parent",
+                    "subsidiary": "subsidiary",
+                    "class": "class",
+                    "includechildren": "includechildren",
+                    "department": "department",
+                    "location": "location",
+
+                    // Item Detail
+                    "unitstype": "unitstype",
+                    "baseunit": "baseunit",
+                    "upccode": "upccode",
+                    "stockunit": "stockunit",
+                    "purchaseunit": "purchaseunit",
+                    "saleunit": "saleunit",
+                    "isserialitem": "isserialitem",
+                    "islotitem": "islotitem",
+
+                    // Item/Cost Detail
+                    "baseprice": "baseprice",
+                    "cost": "cost",
+                    "averagecost": "averagecost",
+                    "lastpurchaseprice": "lastpurchaseprice",
+                    "purchasedescription": "purchasedescription",
+                    "salesdescription": "salesdescription",
+                    "costingmethod": "costingmethod",
+                    "totalquantityonhand": "totalquantityonhand",
+                    "totalvalue": "totalvalue",
+                    "isdropshipitem": "isdropshipitem",
+                    "isspecialorderitem": "isspecialorderitem",
+                    "matchbilltoreceipt": "matchbilltoreceipt",
+                    "stockdescription": "stockdescription",
+                    "tracklandedcost": "tracklandedcost",
+                    "costestimatetype": "costestimatetype",
+
+                    // Accounts
+                    "incomeaccount": "incomeaccount",
+                    "cogsaccount": "cogsaccount",
+                    "assetaccount": "assetaccount",
+                    "taxschedule": "taxschedule",
+
+                    // Manufacturing
+                    "manufacturer": "manufacturer",
+                    "mpn": "mpn",
+                    "countryofmanufacture": "countryofmanufacture",
+
+                    // Supply Planning
+                    "preferredlocation": "preferredlocation",
+                    "reorderpoint": "reorderpoint",
+                    "safetystocklevel": "safetystocklevel",
+                    "leadtime": "leadtime",
+                    "seasonaldemand": "seasonaldemand",
+                    "demandmodifier": "demandmodifier",
+
+                    // Shipping
+                    "weight": "weight",
+                    "weightunit": "weightunit",
+                    "shipindividually": "shipindividually",
+
+                    // General
+                    "type": "type",
+                    "isinactive": "isinactive",
+                    "created": "created",
+                    "lastmodifieddate": "lastmodifieddate",
+
+                    // Inventory
+                    "quantityonhand": "quantityonhand",
+                    "quantityavailable": "quantityavailable",
+                    "quantityonorder": "quantityonorder",
+                    "quantitycommitted": "quantitycommitted",
+                    "inventorylocation": "inventorylocation",
+
+                    // ── Item/Cost Detail — custom fields ──
+                    "condition-custitem1":          "custitem1",
+                    "brand-custitem2":              "custitem2",
+                    "map_price-custitem3":          "custitem3",
+                    "current_map_price-custitem4":  "custitem4",
+                    "cmap_exp_date-custitem5":      "custitem5",
+                    "minimum_price-custitem6":      "custitem6",
+                    "maximum_price-custitem7":      "custitem7",
+                    "vir_primary-custitem8":        "custitem8",
+                    "vir_growth-custitem9":         "custitem9",
+                    "vir_other-custitem10":         "custitem10",
+                    "image_url_1-custitem11":       "custitem11",
+                    "image_url_2-custitem12":       "custitem12",
+                    "image_url_3-custitem13":       "custitem13",
+                    "image_url_4-custitem14":       "custitem14",
+                    "screen_size-custitem15":       "custitem15",
+                    "item_type_custom-custitem16":  "custitem16",
+
+                    // ── TD Synnex tab ──
+                    "synnex_total_inventory-custitem17":  "custitem17",
+                    "synnex_sku-custitem36":              "custitem36",
+                    "synnex_romeoville_il-custitem22":    "custitem22",
+                    "synnex_suwanee_ga-custitem23":       "custitem23",
+                    "synnex_southaven_ms-custitem24":     "custitem24",
+                    "synnex_swedesboro_nj-custitem25":    "custitem25",
+                    "synnex_fort_worth_tx-custitem27":    "custitem27",
+                    "synnex_chino_ca-custitem28":         "custitem28",
+
+                    // ── D&H tab ──
+                    "dh_sku-custitem38":           "custitem38",
+                    "dh_harrisburg_pa-custitem29": "custitem29",
+                    "dh_california-custitem30":    "custitem30",
+                    "dh_chicago_il-custitem31":    "custitem31",
+                    "dh_atlanta_ga-custitem32":    "custitem32",
+
+                    // ── Ingram Micro tab ──
+                    "ingram_sku-custitem40":             "custitem40",
+                    "ingram_mira_loma_ca-custitem33":    "custitem33",
+                    "ingram_carol_stream_il-custitem34": "custitem34",
+                    "ingram_hazelton_pa-custitem35":     "custitem35",
+
+                    // ── Distribution Management (Supplies) tab ──
+                    "dm_sku-custitem39":  "custitem39",
+                    "dm_ca-custitem18":   "custitem18",
+                    "dm_tx-custitem19":   "custitem19",
+                    "dm_pa-custitem20":   "custitem20",
+                    "dm_mo-custitem21":   "custitem21",
+
+                    // ── NewAge tab ──
+                    "newage_sku-custitem37":           "custitem37",
+                    "newage_miami_fl-custitem41":      "custitem41",
+                    "newage_columbus_oh-custitem42":   "custitem42",
+                    "newage_romeoville_il-custitem43": "custitem43",
+                    "newage_suwanee_ga-custitem44":    "custitem44",
+                    "newage_southaven_ms-custitem45":  "custitem45",
+                    "newage_swedesboro_nj-custitem46": "custitem46",
+                    "newage_fort_worth_tx-custitem47": "custitem47",
+                    "newage_chino_ca-custitem48":      "custitem48",
+
+                    // ── EBP / FarApp custom ──
+                    "ebp_tag-custitem_ebp_tag":                          "custitem_ebp_tag",
+                    "atlas_item_image-custitem_atlas_item_image":        "custitem_atlas_item_image",
+                    "custom_uom-custitem_cust_uom":                      "custitem_cust_uom",
+                    "amz_category-custitem_fa_amz_category":             "custitem_fa_amz_category",
+                    "shopify_flag-custitem_fa_shopify_flag":              "custitem_fa_shopify_flag",
+                    "amz_prod_type-custitem_fa_amz_prod_type":           "custitem_fa_amz_prod_type",
+                    "amz_item_type-custitem_fa_amz_item_type":           "custitem_fa_amz_item_type",
+                    "order_delay_count-custitem_order_delay_count":       "custitem_order_delay_count",
+                    "supply_allocation_count-custitem_supply_allocation_count": "custitem_supply_allocation_count",
+                    "supply_planning_count-custitem_supply_planning_count":     "custitem_supply_planning_count",
+                    "last_posted_to_farapp-custitemlastpostedtofarapp":         "custitemlastpostedtofarapp"
+                };
+
+                // Derive parallel arrays: human-readable keys + internal NetSuite field IDs
+                var fifKeyNames = Object.keys(fifFieldMap);           // ["internalid", ..., "synnex_sku", ...]
+                var fifColNames = fifKeyNames.map(function (k) { return fifFieldMap[k]; }); // ["internalid", ..., "custitem36", ...]
+
+                // Columns to also get getText() for (returns label instead of ID)
+                // Uses INTERNAL field IDs (what NetSuite search expects)
+                var fifTextCols = [
+                    "type", "vendor", "class", "subsidiary", "parent",
+                    "department", "location",
+                    "unitstype", "baseunit", "stockunit", "purchaseunit", "saleunit",
+                    "costingmethod", "costestimatetype",
+                    "inventorylocation", "manufacturer",
+                    "incomeaccount", "cogsaccount", "assetaccount", "taxschedule",
+                    "preferredlocation", "weightunit",
+                    "custitem1", "custitem2", "custitem_ebp_tag",
+                    "custitem_fa_amz_category", "custitem_fa_amz_prod_type", "custitem_fa_amz_item_type"
+                ];
+
+                // Build columns — try full set first; if it fails, test each column
+                // individually. search.createColumn() does NOT throw for invalid
+                // fields — the error only surfaces at run() time.
+                var fifColumns = [];
+                var fifActiveKeys = [];   // human-readable keys for active columns
+                var fifActiveCols = [];   // internal field IDs for active columns
+                var fifFailed = [];
+
+                // Attempt 1: try all columns at once (fast path)
+                var fifAllCols = fifColNames.map(function (n) { return search.createColumn({ name: n }); });
+                var fifNeedProbe = false;
+                try {
+                    search.create({
+                        type: search.Type.ITEM,
+                        filters: [["isinactive", "is", "F"]],
+                        columns: fifAllCols
+                    }).run().getRange({ start: 0, end: 1 });
+                    // All columns valid
+                    fifColumns = fifAllCols;
+                    fifActiveKeys = fifKeyNames.slice();
+                    fifActiveCols = fifColNames.slice();
+                } catch (allErr) {
+                    log.audit("FIF_PROBE", "Full set failed: " + allErr.message + ". Probing each column...");
+                    fifNeedProbe = true;
+                }
+
+                // Attempt 2: probe each column individually (only if full set failed)
+                if (fifNeedProbe) {
+                    fifColumns = [];
+                    fifActiveKeys = [];
+                    fifActiveCols = [];
+                    var baseCol = search.createColumn({ name: "internalid" });
+                    for (var ci = 0; ci < fifColNames.length; ci++) {
+                        if (fifColNames[ci] === "internalid") {
+                            fifColumns.push(search.createColumn({ name: "internalid" }));
+                            fifActiveKeys.push(fifKeyNames[ci]);
+                            fifActiveCols.push(fifColNames[ci]);
+                            continue;
+                        }
+                        try {
+                            var probeCol = search.createColumn({ name: fifColNames[ci] });
+                            search.create({
+                                type: search.Type.ITEM,
+                                filters: [["isinactive", "is", "F"]],
+                                columns: [baseCol, probeCol]
+                            }).run().getRange({ start: 0, end: 1 });
+                            fifColumns.push(probeCol);
+                            fifActiveKeys.push(fifKeyNames[ci]);
+                            fifActiveCols.push(fifColNames[ci]);
+                        } catch (probeErr) {
+                            fifFailed.push(fifKeyNames[ci] + " (" + fifColNames[ci] + ")");
+                            log.audit("FIF_SKIP", fifColNames[ci] + ": " + probeErr.message);
+                        }
+                    }
+                }
+
+                var fifSearch = search.create({
+                    type: search.Type.ITEM,
+                    filters: [["isinactive", "is", "F"]],
+                    columns: fifColumns
+                });
+
+                var fifPaged = fifSearch.runPaged({ pageSize: fifPageSize });
+                var fifTotal = fifPaged.count;
+                var fifTotalPages = fifPaged.pageRanges.length;
+
+                if (fifTotal === 0 || fifPage >= fifTotalPages) {
+                    result.fetch_all_items_full = {
+                        page: fifPage, pageSize: fifPageSize,
+                        total: fifTotal, totalPages: fifTotalPages,
+                        count: 0, items: [], done: true,
+                        fields: fifActiveKeys,
+                        skippedFields: fifFailed.length > 0 ? fifFailed : undefined
+                    };
+                } else {
+                    var fifItems = [];
+                    var fifPageData = fifPaged.fetch({ index: fifPage });
+
+                    fifPageData.data.forEach(function (r) {
+                        var item = {};
+                        for (var fi = 0; fi < fifActiveKeys.length; fi++) {
+                            try {
+                                // Use human-readable key, read value from internal column
+                                item[fifActiveKeys[fi]] = r.getValue(fifColumns[fi]);
+                                // Add _text suffix for columns with text labels
+                                if (fifTextCols.indexOf(fifActiveCols[fi]) >= 0) {
+                                    var ftxt = r.getText(fifColumns[fi]);
+                                    if (ftxt) item[fifActiveKeys[fi] + "_text"] = ftxt;
+                                }
+                            } catch (fErr) {
+                                item[fifActiveKeys[fi]] = null;
+                            }
+                        }
+                        fifItems.push(item);
+                    });
+
+                    result.fetch_all_items_full = {
+                        page: fifPage, pageSize: fifPageSize,
+                        total: fifTotal, totalPages: fifTotalPages,
+                        count: fifItems.length, items: fifItems,
+                        done: fifPage >= fifTotalPages - 1,
+                        fields: fifActiveKeys,
+                        skippedFields: fifFailed.length > 0 ? fifFailed : undefined
+                    };
+                }
+            } catch (e) {
+                result.fetch_all_items_full = { error: e.message };
+            }
+        }
+
+        // ── Fetch Items FAST (SuiteQL — bigger pages, faster pagination) ──────
+        // POST: { "sections": ["fetch_items_fast"], "page": 0, "pageSize": 2000 }
+        // Uses N/query SuiteQL for OFFSET/FETCH NEXT pagination (up to 5000/page).
+        // BUILTIN.DF() gives text labels inline (no separate getText() calls).
+        // Column resilience: if full query fails, drops bad columns and retries.
+        // Same human-readable "description-internal_id" key format as fetch_all_items_full.
+        if (sections.indexOf("fetch_items_fast") >= 0) {
+            var fiqPage = parseInt(payload.page, 10) || 0;
+            var fiqPageSize = parseInt(payload.pageSize, 10) || 2000;
+            if (fiqPageSize > 5000) fiqPageSize = 5000;
+
+            try {
+                // ── SuiteQL column map: alias → SQL expression ──
+                // Standard fields use table column names.
+                // Custom fields use custitem IDs directly.
+                // BUILTIN.DF() wraps list/record fields to get text labels inline.
+                var fiqColMap = {
+                    // Primary Information
+                    "internalid":       "i.id",
+                    "externalid":       "i.externalid",
+                    "itemid":           "i.itemid",
+                    "displayname":      "i.displayname",
+                    "vendorname":       "i.vendorname",
+                    "parent":           "i.parent",
+                    "parent_text":      "BUILTIN.DF(i.parent) AS parent_text",
+                    "subsidiary":       "i.subsidiary",
+                    "subsidiary_text":  "BUILTIN.DF(i.subsidiary) AS subsidiary_text",
+                    "class":            "i.class",
+                    "class_text":       "BUILTIN.DF(i.class) AS class_text",
+                    "includechildren":  "i.includechildren",
+                    "department":       "i.department",
+                    "department_text":  "BUILTIN.DF(i.department) AS department_text",
+                    "location":         "i.location",
+                    "location_text":    "BUILTIN.DF(i.location) AS location_text",
+
+                    // Item Detail
+                    "unitstype":        "i.unitstype",
+                    "unitstype_text":   "BUILTIN.DF(i.unitstype) AS unitstype_text",
+                    "baseunit":         "i.baseunit",
+                    "upccode":          "i.upccode",
+                    "stockunit":        "i.stockunit",
+                    "purchaseunit":     "i.purchaseunit",
+                    "saleunit":         "i.saleunit",
+                    "isserialitem":     "i.isserialitem",
+                    "islotitem":        "i.islotitem",
+
+                    // Item/Cost Detail
+                    "baseprice":        "i.baseprice",
+                    "cost":             "i.cost",
+                    "averagecost":      "i.averagecost",
+                    "lastpurchaseprice": "i.lastpurchaseprice",
+                    "purchasedescription": "i.purchasedescription",
+                    "salesdescription": "i.salesdescription",
+                    "costingmethod":    "i.costingmethod",
+                    "costingmethod_text": "BUILTIN.DF(i.costingmethod) AS costingmethod_text",
+                    "totalquantityonhand": "i.totalquantityonhand",
+                    "totalvalue":       "i.totalvalue",
+                    "isdropshipitem":   "i.isdropshipitem",
+                    "isspecialorderitem": "i.isspecialorderitem",
+                    "matchbilltoreceipt": "i.matchbilltoreceipt",
+                    "stockdescription": "i.stockdescription",
+                    "tracklandedcost":  "i.tracklandedcost",
+                    "costestimatetype": "i.costestimatetype",
+
+                    // Accounts
+                    "incomeaccount":    "i.incomeaccount",
+                    "incomeaccount_text": "BUILTIN.DF(i.incomeaccount) AS incomeaccount_text",
+                    "cogsaccount":      "i.cogsaccount",
+                    "cogsaccount_text": "BUILTIN.DF(i.cogsaccount) AS cogsaccount_text",
+                    "assetaccount":     "i.assetaccount",
+                    "assetaccount_text": "BUILTIN.DF(i.assetaccount) AS assetaccount_text",
+                    "taxschedule":      "i.taxschedule",
+                    "taxschedule_text": "BUILTIN.DF(i.taxschedule) AS taxschedule_text",
+
+                    // Manufacturing
+                    "manufacturer":     "i.manufacturer",
+                    "manufacturer_text": "BUILTIN.DF(i.manufacturer) AS manufacturer_text",
+                    "mpn":              "i.mpn",
+                    "countryofmanufacture": "i.countryofmanufacture",
+
+                    // Supply Planning
+                    "preferredlocation": "i.preferredlocation",
+                    "preferredlocation_text": "BUILTIN.DF(i.preferredlocation) AS preferredlocation_text",
+                    "reorderpoint":     "i.reorderpoint",
+                    "safetystocklevel": "i.safetystocklevel",
+                    "leadtime":         "i.leadtime",
+                    "seasonaldemand":   "i.seasonaldemand",
+                    "demandmodifier":   "i.demandmodifier",
+
+                    // Shipping
+                    "weight":           "i.weight",
+                    "weightunit":       "i.weightunit",
+                    "weightunit_text":  "BUILTIN.DF(i.weightunit) AS weightunit_text",
+                    "shipindividually": "i.shipindividually",
+
+                    // General
+                    "type":             "i.itemtype",
+                    "type_text":        "BUILTIN.DF(i.itemtype) AS type_text",
+                    "isinactive":       "i.isinactive",
+                    "created":          "i.createddate",
+                    "lastmodifieddate": "i.lastmodifieddate",
+
+                    // Inventory
+                    "quantityonhand":     "i.quantityonhand",
+                    "quantityavailable":  "i.quantityavailable",
+                    "quantityonorder":    "i.quantityonorder",
+                    "quantitycommitted":  "i.quantitycommitted",
+                    "inventorylocation":  "i.inventorylocation",
+                    "inventorylocation_text": "BUILTIN.DF(i.inventorylocation) AS inventorylocation_text",
+
+                    // ── Custom fields (human_readable-internal_id format) ──
+                    "condition-custitem1":          "i.custitem1",
+                    "condition_text-custitem1":     "BUILTIN.DF(i.custitem1) AS condition_text",
+                    "brand-custitem2":              "i.custitem2",
+                    "brand_text-custitem2":         "BUILTIN.DF(i.custitem2) AS brand_text",
+                    "map_price-custitem3":          "i.custitem3",
+                    "current_map_price-custitem4":  "i.custitem4",
+                    "cmap_exp_date-custitem5":      "i.custitem5",
+                    "minimum_price-custitem6":      "i.custitem6",
+                    "maximum_price-custitem7":      "i.custitem7",
+                    "vir_primary-custitem8":        "i.custitem8",
+                    "vir_growth-custitem9":         "i.custitem9",
+                    "vir_other-custitem10":         "i.custitem10",
+                    "image_url_1-custitem11":       "i.custitem11",
+                    "image_url_2-custitem12":       "i.custitem12",
+                    "image_url_3-custitem13":       "i.custitem13",
+                    "image_url_4-custitem14":       "i.custitem14",
+                    "screen_size-custitem15":       "i.custitem15",
+                    "item_type_custom-custitem16":  "i.custitem16",
+
+                    // TD Synnex
+                    "synnex_total_inventory-custitem17": "i.custitem17",
+                    "synnex_sku-custitem36":             "i.custitem36",
+                    "synnex_romeoville_il-custitem22":   "i.custitem22",
+                    "synnex_suwanee_ga-custitem23":      "i.custitem23",
+                    "synnex_southaven_ms-custitem24":    "i.custitem24",
+                    "synnex_swedesboro_nj-custitem25":   "i.custitem25",
+                    "synnex_fort_worth_tx-custitem27":   "i.custitem27",
+                    "synnex_chino_ca-custitem28":        "i.custitem28",
+
+                    // D&H
+                    "dh_sku-custitem38":           "i.custitem38",
+                    "dh_harrisburg_pa-custitem29": "i.custitem29",
+                    "dh_california-custitem30":    "i.custitem30",
+                    "dh_chicago_il-custitem31":    "i.custitem31",
+                    "dh_atlanta_ga-custitem32":    "i.custitem32",
+
+                    // Ingram Micro
+                    "ingram_sku-custitem40":             "i.custitem40",
+                    "ingram_mira_loma_ca-custitem33":    "i.custitem33",
+                    "ingram_carol_stream_il-custitem34": "i.custitem34",
+                    "ingram_hazelton_pa-custitem35":     "i.custitem35",
+
+                    // Distribution Management
+                    "dm_sku-custitem39":  "i.custitem39",
+                    "dm_ca-custitem18":   "i.custitem18",
+                    "dm_tx-custitem19":   "i.custitem19",
+                    "dm_pa-custitem20":   "i.custitem20",
+                    "dm_mo-custitem21":   "i.custitem21",
+
+                    // NewAge
+                    "newage_sku-custitem37":           "i.custitem37",
+                    "newage_miami_fl-custitem41":      "i.custitem41",
+                    "newage_columbus_oh-custitem42":   "i.custitem42",
+                    "newage_romeoville_il-custitem43": "i.custitem43",
+                    "newage_suwanee_ga-custitem44":    "i.custitem44",
+                    "newage_southaven_ms-custitem45":  "i.custitem45",
+                    "newage_swedesboro_nj-custitem46": "i.custitem46",
+                    "newage_fort_worth_tx-custitem47": "i.custitem47",
+                    "newage_chino_ca-custitem48":      "i.custitem48",
+
+                    // EBP / FarApp
+                    "ebp_tag-custitem_ebp_tag":                          "i.custitem_ebp_tag",
+                    "ebp_tag_text-custitem_ebp_tag":                     "BUILTIN.DF(i.custitem_ebp_tag) AS ebp_tag_text",
+                    "atlas_item_image-custitem_atlas_item_image":        "i.custitem_atlas_item_image",
+                    "custom_uom-custitem_cust_uom":                      "i.custitem_cust_uom",
+                    "amz_category-custitem_fa_amz_category":             "i.custitem_fa_amz_category",
+                    "amz_category_text-custitem_fa_amz_category":        "BUILTIN.DF(i.custitem_fa_amz_category) AS amz_category_text",
+                    "shopify_flag-custitem_fa_shopify_flag":              "i.custitem_fa_shopify_flag",
+                    "amz_prod_type-custitem_fa_amz_prod_type":           "i.custitem_fa_amz_prod_type",
+                    "amz_prod_type_text-custitem_fa_amz_prod_type":      "BUILTIN.DF(i.custitem_fa_amz_prod_type) AS amz_prod_type_text",
+                    "amz_item_type-custitem_fa_amz_item_type":           "i.custitem_fa_amz_item_type",
+                    "amz_item_type_text-custitem_fa_amz_item_type":      "BUILTIN.DF(i.custitem_fa_amz_item_type) AS amz_item_type_text",
+                    "order_delay_count-custitem_order_delay_count":       "i.custitem_order_delay_count",
+                    "supply_allocation_count-custitem_supply_allocation_count": "i.custitem_supply_allocation_count",
+                    "supply_planning_count-custitem_supply_planning_count":     "i.custitem_supply_planning_count",
+                    "last_posted_to_farapp-custitemlastpostedtofarapp":         "i.custitemlastpostedtofarapp"
+                };
+
+                var fiqKeys = Object.keys(fiqColMap);
+                var fiqExprs = fiqKeys.map(function (k) { return fiqColMap[k]; });
+
+                // Build SELECT expressions — for BUILTIN.DF() columns, the expression IS the alias.
+                // For plain columns, alias as the key name.
+                var fiqSelectParts = [];
+                for (var fqi = 0; fqi < fiqKeys.length; fqi++) {
+                    var expr = fiqExprs[fqi];
+                    if (expr.indexOf("BUILTIN.DF") >= 0) {
+                        // Already has AS alias
+                        fiqSelectParts.push(expr);
+                    } else {
+                        // Plain column — alias with the human-readable key
+                        fiqSelectParts.push(expr + " AS " + sanitizeAlias(fiqKeys[fqi]));
+                    }
+                }
+
+                // ── Get total count first ──
+                var fiqCountSql = "SELECT COUNT(*) AS cnt FROM item i WHERE i.isinactive = 'F'";
+                var fiqCountResult = query.runSuiteQL({ query: fiqCountSql });
+                var fiqTotal = 0;
+                if (fiqCountResult && fiqCountResult.results && fiqCountResult.results.length > 0) {
+                    fiqTotal = parseInt(fiqCountResult.results[0].values[0], 10) || 0;
+                }
+
+                var fiqOffset = fiqPage * fiqPageSize;
+                if (fiqTotal === 0 || fiqOffset >= fiqTotal) {
+                    result.fetch_items_fast = {
+                        page: fiqPage, pageSize: fiqPageSize,
+                        total: fiqTotal, count: 0, items: [], done: true,
+                        fields: fiqKeys
+                    };
+                } else {
+                    // ── Try full query — if it fails, drop bad columns and retry ──
+                    var fiqActiveKeys = fiqKeys.slice();
+                    var fiqActiveSelects = fiqSelectParts.slice();
+                    var fiqSkipped = [];
+                    var fiqItems = [];
+
+                    var fiqBaseSql = " FROM item i WHERE i.isinactive = 'F' ORDER BY i.id";
+                    var fiqPageSql = " OFFSET " + fiqOffset + " ROWS FETCH NEXT " + fiqPageSize + " ROWS ONLY";
+
+                    // Attempt 1: full query
+                    var fiqSuccess = false;
+                    try {
+                        var fiqFullSql = "SELECT " + fiqActiveSelects.join(", ") + fiqBaseSql + fiqPageSql;
+                        var fiqResult = query.runSuiteQL({ query: fiqFullSql });
+                        fiqItems = mapSuiteQLResults(fiqResult, fiqActiveKeys);
+                        fiqSuccess = true;
+                    } catch (fullErr) {
+                        log.audit("FIQ_PROBE", "Full SuiteQL failed: " + fullErr.message + ". Probing columns...");
+                    }
+
+                    // Attempt 2: binary-split column probing (find bad columns fast)
+                    if (!fiqSuccess) {
+                        var fiqGoodKeys = [];
+                        var fiqGoodSelects = [];
+
+                        // Always keep id (internalid) as anchor
+                        fiqGoodKeys.push(fiqKeys[0]);
+                        fiqGoodSelects.push(fiqSelectParts[0]);
+
+                        // Test remaining columns in chunks of 10
+                        var chunkSize = 10;
+                        for (var ci = 1; ci < fiqKeys.length; ci += chunkSize) {
+                            var chunkKeys = fiqKeys.slice(ci, ci + chunkSize);
+                            var chunkSelects = fiqSelectParts.slice(ci, ci + chunkSize);
+
+                            // Try the whole chunk
+                            var testSelects = [fiqSelectParts[0]].concat(chunkSelects);
+                            var testSql = "SELECT " + testSelects.join(", ") + fiqBaseSql + " OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY";
+
+                            try {
+                                query.runSuiteQL({ query: testSql });
+                                // Whole chunk is good
+                                for (var cki = 0; cki < chunkKeys.length; cki++) {
+                                    fiqGoodKeys.push(chunkKeys[cki]);
+                                    fiqGoodSelects.push(chunkSelects[cki]);
+                                }
+                            } catch (chunkErr) {
+                                // Some column in this chunk is bad — test individually
+                                for (var sci = 0; sci < chunkKeys.length; sci++) {
+                                    var singleTestSql = "SELECT " + fiqSelectParts[0] + ", " + chunkSelects[sci] + fiqBaseSql + " OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY";
+                                    try {
+                                        query.runSuiteQL({ query: singleTestSql });
+                                        fiqGoodKeys.push(chunkKeys[sci]);
+                                        fiqGoodSelects.push(chunkSelects[sci]);
+                                    } catch (singleErr) {
+                                        fiqSkipped.push(chunkKeys[sci]);
+                                        log.audit("FIQ_SKIP", chunkKeys[sci] + ": " + singleErr.message);
+                                    }
+                                }
+                            }
+                        }
+
+                        fiqActiveKeys = fiqGoodKeys;
+                        fiqActiveSelects = fiqGoodSelects;
+
+                        // Retry with validated columns
+                        var fiqRetrySql = "SELECT " + fiqActiveSelects.join(", ") + fiqBaseSql + fiqPageSql;
+                        var fiqRetryResult = query.runSuiteQL({ query: fiqRetrySql });
+                        fiqItems = mapSuiteQLResults(fiqRetryResult, fiqActiveKeys);
+                    }
+
+                    result.fetch_items_fast = {
+                        page: fiqPage, pageSize: fiqPageSize,
+                        total: fiqTotal, count: fiqItems.length, items: fiqItems,
+                        done: (fiqOffset + fiqItems.length) >= fiqTotal,
+                        fields: fiqActiveKeys,
+                        skippedFields: fiqSkipped.length > 0 ? fiqSkipped : undefined
+                    };
+                }
+            } catch (e) {
+                result.fetch_items_fast = { error: e.message };
+            }
+        }
+
+        // ── Custom Item Field Map (field ID → label) ──────────────────────
+        // POST: { "sections": ["item_field_map"] }
+        // POST: { "sections": ["item_field_map"], "itemId": 12692 }
+        // Loads an item record and reads the label for every custitem* field.
+        // Labels reveal which distributor tab each field belongs to.
+        if (sections.indexOf("item_field_map") >= 0) {
+            var fmItemId = parseInt(payload.itemId, 10) || 12692; // default: 29S0100
+            try {
+                var fmRec;
+                try {
+                    fmRec = record.load({ type: record.Type.SERIALIZED_INVENTORY_ITEM, id: fmItemId, isDynamic: false });
+                } catch (e1) {
+                    try {
+                        fmRec = record.load({ type: record.Type.INVENTORY_ITEM, id: fmItemId, isDynamic: false });
+                    } catch (e2) {
+                        fmRec = record.load({ type: record.Type.NON_INVENTORY_ITEM, id: fmItemId, isDynamic: false });
+                    }
+                }
+
+                var fmAllFields = fmRec.getFields();
+                var fmCustomFields = fmAllFields.filter(function (f) {
+                    return f.indexOf("custitem") === 0;
+                });
+
+                var fmResults = [];
+                for (var fmi = 0; fmi < fmCustomFields.length; fmi++) {
+                    var fmFieldId = fmCustomFields[fmi];
+                    var fmInfo = { fieldId: fmFieldId };
+                    try {
+                        var fmField = fmRec.getField({ fieldId: fmFieldId });
+                        if (fmField) {
+                            fmInfo.label = fmField.label || null;
+                            fmInfo.type = fmField.type || null;
+                            fmInfo.isMandatory = fmField.isMandatory || false;
+                        }
+                    } catch (e) {}
+                    try {
+                        fmInfo.value = fmRec.getValue({ fieldId: fmFieldId });
+                    } catch (e) {}
+                    try {
+                        fmInfo.text = fmRec.getText({ fieldId: fmFieldId });
+                    } catch (e) {}
+                    fmResults.push(fmInfo);
+                }
+
+                result.item_field_map = {
+                    itemId: fmItemId,
+                    totalCustomFields: fmResults.length,
+                    fields: fmResults
+                };
+            } catch (e) {
+                result.item_field_map = { error: e.message };
+            }
+        }
+
+        // ── Fetch Item Sublists (Locations + Vendors via record.load) ─────────
+        // POST: { "sections": ["fetch_item_sublists"], "itemIds": [123, 456, 789] }
+        // Loads each item record and extracts Location + Vendor sublist data.
+        // Max 50 items per call (governance: record.load = 10 units each).
+        if (sections.indexOf("fetch_item_sublists") >= 0) {
+            var slItemIds = payload.itemIds || [];
+            if (slItemIds.length > 50) slItemIds = slItemIds.slice(0, 50);
+
+            var slResults = [];
+            for (var sli = 0; sli < slItemIds.length; sli++) {
+                var slId = slItemIds[sli];
+                try {
+                    // Try serialized first (most items in this account), fall back to inventory
+                    var slRec;
+                    try {
+                        slRec = record.load({
+                            type: record.Type.SERIALIZED_INVENTORY_ITEM,
+                            id: parseInt(slId, 10),
+                            isDynamic: false
+                        });
+                    } catch (serErr) {
+                        slRec = record.load({
+                            type: record.Type.INVENTORY_ITEM,
+                            id: parseInt(slId, 10),
+                            isDynamic: false
+                        });
+                    }
+
+                    var slItem = { internalid: slId, locations: [], vendors: [] };
+
+                    // ── Locations sublist ──
+                    var slLocFields = [
+                        "location", "quantityonhand", "quantityavailable",
+                        "quantityonorder", "quantitycommitted",
+                        "averagecostmli", "lastpurchasepricemli",
+                        "reorderpoint", "preferredstocklevel",
+                        "costaccountingstatus", "defaultreturncosmli"
+                    ];
+                    var slLocCount = 0;
+                    try { slLocCount = slRec.getLineCount({ sublistId: "locations" }); } catch (e) {}
+
+                    for (var lli = 0; lli < slLocCount; lli++) {
+                        var locLine = {};
+                        for (var lfi = 0; lfi < slLocFields.length; lfi++) {
+                            try {
+                                locLine[slLocFields[lfi]] = slRec.getSublistValue({
+                                    sublistId: "locations", fieldId: slLocFields[lfi], line: lli
+                                });
+                            } catch (e) {}
+                            try {
+                                var ltxt = slRec.getSublistText({
+                                    sublistId: "locations", fieldId: slLocFields[lfi], line: lli
+                                });
+                                if (ltxt) locLine[slLocFields[lfi] + "_text"] = ltxt;
+                            } catch (e) {}
+                        }
+                        slItem.locations.push(locLine);
+                    }
+
+                    // ── Vendors sublist (itemvendor) ──
+                    var slVendorFields = [
+                        "vendor", "vendorname", "purchaseprice", "preferredvendor"
+                    ];
+                    var slVendCount = 0;
+                    try { slVendCount = slRec.getLineCount({ sublistId: "itemvendor" }); } catch (e) {}
+
+                    for (var vli = 0; vli < slVendCount; vli++) {
+                        var vendLine = {};
+                        for (var vfi = 0; vfi < slVendorFields.length; vfi++) {
+                            try {
+                                vendLine[slVendorFields[vfi]] = slRec.getSublistValue({
+                                    sublistId: "itemvendor", fieldId: slVendorFields[vfi], line: vli
+                                });
+                            } catch (e) {}
+                            try {
+                                var vtxt = slRec.getSublistText({
+                                    sublistId: "itemvendor", fieldId: slVendorFields[vfi], line: vli
+                                });
+                                if (vtxt) vendLine[slVendorFields[vfi] + "_text"] = vtxt;
+                            } catch (e) {}
+                        }
+                        slItem.vendors.push(vendLine);
+                    }
+
+                    slResults.push(slItem);
+                } catch (slErr) {
+                    slResults.push({ internalid: slId, error: slErr.message });
+                }
+            }
+
+            result.fetch_item_sublists = {
+                requested: slItemIds.length,
+                returned: slResults.length,
+                items: slResults
+            };
+        }
+
         log.audit("DIAGNOSTIC", "Sections: " + sections.join(", "));
         return result;
     }
@@ -585,6 +1675,32 @@ define(["N/search", "N/record", "N/runtime", "N/log"], function (search, record,
                 });
             return rows;
         } catch (e) { return "Error: " + e.message; }
+    }
+
+    /**
+     * Sanitize a key name into a valid SQL alias (letters, digits, underscores only).
+     * Replaces hyphens with underscores, strips anything else.
+     */
+    function sanitizeAlias(key) {
+        return key.replace(/-/g, "_").replace(/[^a-zA-Z0-9_]/g, "");
+    }
+
+    /**
+     * Map SuiteQL ResultSet → array of objects keyed by the human-readable key names.
+     * SuiteQL results come back as positional arrays in result.values.
+     */
+    function mapSuiteQLResults(resultSet, keyNames) {
+        var items = [];
+        if (!resultSet || !resultSet.results) return items;
+        for (var ri = 0; ri < resultSet.results.length; ri++) {
+            var vals = resultSet.results[ri].values;
+            var item = {};
+            for (var ki = 0; ki < keyNames.length; ki++) {
+                item[keyNames[ki]] = (ki < vals.length) ? vals[ki] : null;
+            }
+            items.push(item);
+        }
+        return items;
     }
 
     return { post: post };
