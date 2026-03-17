@@ -1,0 +1,24 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "Purchase_Order_and_Bill_Sync_sagar",
+    "feature/netsuite-erp-sync",
+    "fix/netsuite-classifications-sync",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "Purchase_Order_and_Bill_Sync_sagar": "main",
+    "feature/netsuite-erp-sync": "main",
+    "fix/netsuite-classifications-sync": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "Purchase_Order_and_Bill_Sync_sagar",
+    "feature/netsuite-erp-sync",
+    "fix/netsuite-classifications-sync",
+    "origin"
+  ]
+}
