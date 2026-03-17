@@ -63,7 +63,6 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
     var _customerCache = {};
     var _channelCache = {};
     var _formCache = {};
-    var _fallbackLocationCache = {};
 
     // ═══════════════════════════════════════════════════════════════════════════
     // MAIN
@@ -81,7 +80,6 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var fulfillment_channel = payload.fulfillment_channel || "";
             var ship_date           = payload.ship_date;
             var items               = payload.items;
-            var po                  = payload.po;
 
             if (!otherrefnum) {
                 return { success: false, error: "Missing otherrefnum" };
@@ -184,13 +182,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             try { so.setValue({ fieldId: "custbody1", value: String(order_status) }); } catch (e) {}
             try { so.setValue({ fieldId: "custbody3", value: String(fulfillment_channel) }); } catch (e) {}
 
-            // Memo
-            var memo = "";
-            if (Array.isArray(po) && po.length > 0) {
-                var poNums = po.map(function (p) { return p.po_number; }).filter(Boolean).join(", ");
-                if (poNums) memo = "PO: " + poNums;
-            }
-            so.setValue({ fieldId: "memo", value: memo });
+            // Memo — intentionally not set (leave blank)
 
             // ── Track existing lines (will be removed AFTER new lines are added) ─
             // NetSuite requires at least one valid line on a loaded record at all
@@ -249,26 +241,15 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                             continue;
                         }
 
-                        var locationId = findLocationForItem(itemInternalId, soSubsidiary);
-                        if (!locationId) {
-                            log.error("NO_LOCATION", "No location for item " + itemInternalId);
-                            skippedSkus.push(sku + " (no location)");
-                            continue;
-                        }
-
                         var qty = parseInt(lineItem.quantity, 10) || 1;
                         var amt = parseFloat(lineItem.amount) || 0;
                         var rate = qty > 0 ? (amt / qty) : amt;
 
                         log.debug("LINE_CALC_" + i, JSON.stringify({
-                            sku: sku, itemId: itemInternalId, locationId: locationId,
+                            sku: sku, itemId: itemInternalId,
                             rawQty: lineItem.quantity, rawAmt: lineItem.amount,
                             parsedQty: qty, parsedAmt: amt, calcRate: rate
                         }));
-
-                        if (amt === 0) {
-                            log.audit("ZERO_AMOUNT", "SKU " + sku + " has $0 amount — may cause save error");
-                        }
 
                         // Dynamic mode: selectNewLine → set fields → commitLine
                         so.selectNewLine({ sublistId: "item" });
@@ -276,8 +257,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         // Item FIRST — triggers sourcing (tax engine, defaults)
                         so.setCurrentSublistValue({ sublistId: "item", fieldId: "item", value: itemInternalId });
 
-                        // Location BEFORE quantity
-                        so.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: parseInt(locationId, 10) });
+                        // Location — intentionally not set (let NetSuite default)
 
                         // Quantity
                         so.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: qty });
@@ -293,13 +273,12 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         // Verify committed line (new lines append after old ones)
                         var vIdx = oldLineCount + linesAdded;
                         var vItem = so.getSublistValue({ sublistId: "item", fieldId: "item", line: vIdx });
-                        var vLoc = so.getSublistValue({ sublistId: "item", fieldId: "location", line: vIdx });
                         var vQty = so.getSublistValue({ sublistId: "item", fieldId: "quantity", line: vIdx });
                         var vAmt = so.getSublistValue({ sublistId: "item", fieldId: "amount", line: vIdx });
                         log.debug("LINE_COMMITTED", JSON.stringify({
                             line: vIdx, sku: sku, id: itemInternalId,
-                            qty: qty, rate: rate, amt: amt, loc: locationId,
-                            v_item: vItem, v_loc: vLoc, v_qty: vQty, v_amt: vAmt
+                            qty: qty, rate: rate, amt: amt,
+                            v_item: vItem, v_qty: vQty, v_amt: vAmt
                         }));
 
                         linesAdded++;
@@ -512,60 +491,6 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         }
 
         log.audit("FORM_NOT_FOUND", "Could not find form: " + formName);
-        return null;
-    }
-
-    function findLocationForItem(itemInternalId, subsidiaryId) {
-        log.debug("LOC_LOOKUP", "Finding location for item=" + itemInternalId + " subsidiary=" + subsidiaryId);
-        try {
-            var locCol = search.createColumn({ name: "inventorylocation" });
-            var locResults = search.create({
-                type: search.Type.ITEM,
-                filters: [["internalid", "anyof", itemInternalId]],
-                columns: [locCol]
-            }).run().getRange({ start: 0, end: 1 });
-
-            if (locResults.length > 0) {
-                var locId = locResults[0].getValue(locCol);
-                var locText = locResults[0].getText(locCol) || "";
-                log.debug("LOC_FROM_ITEM", "Item " + itemInternalId + " → location " + locId + " (" + locText + ")");
-                if (locId) {
-                    return locId;
-                }
-            } else {
-                log.debug("LOC_FROM_ITEM", "No inventorylocation found for item " + itemInternalId);
-            }
-        } catch (e) {
-            log.debug("LOC_ITEM_ERR", e.message);
-        }
-
-        if (_fallbackLocationCache[subsidiaryId]) {
-            return _fallbackLocationCache[subsidiaryId];
-        }
-
-        try {
-            var idCol = search.createColumn({ name: "internalid" });
-            var nameCol = search.createColumn({ name: "name" });
-            var subLocResults = search.create({
-                type: "location",
-                filters: [
-                    ["subsidiary", "anyof", subsidiaryId],
-                    "AND",
-                    ["isinactive", "is", "F"]
-                ],
-                columns: [idCol, nameCol]
-            }).run().getRange({ start: 0, end: 1 });
-
-            if (subLocResults.length > 0) {
-                var fallbackId = subLocResults[0].getValue(idCol);
-                log.audit("LOC_FALLBACK", "Using " + subLocResults[0].getValue(nameCol) + " (ID " + fallbackId + ")");
-                _fallbackLocationCache[subsidiaryId] = fallbackId;
-                return fallbackId;
-            }
-        } catch (e) {
-            log.debug("LOC_SUB_ERR", e.message);
-        }
-
         return null;
     }
 
