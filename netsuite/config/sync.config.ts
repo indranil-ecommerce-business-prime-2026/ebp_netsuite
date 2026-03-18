@@ -14,7 +14,7 @@ export const SYNC_MODE: "skip" | "update" = "update";
 
 // ⚠️ TEST_MODE: When true, stops after the first real insert/update (skips don't count).
 // Set to false for full production sync.
-export const TEST_MODE = true;
+export const TEST_MODE = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STOP_ON_ERROR: Controls what happens when one order fails.
