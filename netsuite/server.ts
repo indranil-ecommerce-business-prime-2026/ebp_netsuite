@@ -225,7 +225,7 @@ cron.schedule("*/30 * * * *", async () => {
     await syncSalesOrdersToNetsuite();
 });
 
-// ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
+// // ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
 // cron.schedule("*/30 * * * *", async () => {
 //     console.log("[CRON] [PO] Step 1 — Staging purchase orders (shipped / invoiced)...");
 //     await stagePurchaseOrders();
@@ -233,3 +233,14 @@ cron.schedule("*/30 * * * *", async () => {
 //     console.log("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
 //     await syncPurchaseOrdersToNetsuite();
 // });
+
+// ─── CRON: Every hour — Item Sublists (Locations + Vendors) ─────────────────
+cron.schedule("0 * * * *", async () => {
+    console.log("[CRON] [ITEM-SUBLISTS] Fetching Location/Vendor sublists for inventory items...");
+    try {
+        const result = await runItemSublistsSync();
+        console.log(`[CRON] [ITEM-SUBLISTS] Done. Updated: ${result.updated}/${result.total}`);
+    } catch (err: any) {
+        console.error("[CRON] [ITEM-SUBLISTS] Error:", err.message);
+    }
+});
