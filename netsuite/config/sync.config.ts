@@ -10,7 +10,7 @@
 // HOW TO TOGGLE: Change the value below and restart the server.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const SYNC_MODE: "skip" | "update" = "update";
+export const SYNC_MODE: "skip" | "update" = "skip";
 
 // ⚠️ TEST_MODE: When true, stops after the first real insert/update (skips don't count).
 // Set to false for full production sync.
