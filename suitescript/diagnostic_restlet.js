@@ -41,8 +41,10 @@
 define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (search, record, runtime, log, query) {
 
     function post(payload) {
+        log.debug("DIAGNOSTIC_ENTRY", "Payload received: " + JSON.stringify(payload));
         var sections = (payload && payload.sections) || ["all"];
         var isAll = sections.indexOf("all") >= 0;
+        log.debug("DIAGNOSTIC_SECTIONS", "Sections: " + JSON.stringify(sections) + ", isAll: " + isAll);
         var result = { _timestamp: new Date().toISOString() };
 
         // ── Account Info ─────────────────────────────────────────────────
@@ -1631,6 +1633,326 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
                 returned: slResults.length,
                 items: slResults
             };
+        }
+
+        // ── Create Test SOs (hardcoded dummy data — no searches needed) ─────
+        // POST: { "sections": ["create_test_so"], "count": 1 }
+        if (sections.indexOf("create_test_so") >= 0) {
+            var TEST_CUSTOMER_ID = 112;      // Amazon — confirmed
+            var TEST_SKU         = payload.sku || "29S0100";
+            var TEST_CHANNEL_ID  = 1;        // Amazon channel (csegecomm_channel)
+
+            // Dynamic item lookup by SKU (same pattern as SO RESTlet lines 220-230)
+            var TEST_ITEM_ID = null;
+            try {
+                var itemCol = search.createColumn({ name: "internalid" });
+                var itemResults = search.create({
+                    type: search.Type.ITEM,
+                    filters: [["itemid", "is", TEST_SKU]],
+                    columns: [itemCol]
+                }).run().getRange({ start: 0, end: 1 });
+                if (itemResults && itemResults.length > 0) {
+                    TEST_ITEM_ID = parseInt(itemResults[0].getValue(itemCol), 10);
+                }
+                log.debug("TEST_SO_ITEM", "SKU=" + TEST_SKU + " → ID=" + TEST_ITEM_ID);
+            } catch (itemErr) {
+                log.audit("TEST_SO_ITEM", "Item lookup failed for SKU " + TEST_SKU + ": " + itemErr.message);
+            }
+
+            if (!TEST_ITEM_ID) {
+                result.create_test_so = {
+                    error: "Item not found for SKU: " + TEST_SKU + ". Pass a valid SKU via payload.sku"
+                };
+                return result;
+            }
+
+            // Dynamic form lookup — find "Ecomm BP - Sales Order" (same as SO RESTlet's findFormId)
+            var TEST_FORM_ID = null;
+            try {
+                var fCol = search.createColumn({ name: "customform" });
+                var fResults = search.create({
+                    type: search.Type.SALES_ORDER,
+                    filters: [["mainline", "is", "T"]],
+                    columns: [fCol]
+                }).run().getRange({ start: 0, end: 50 });
+                for (var fi = 0; fi < fResults.length; fi++) {
+                    var fName = fResults[fi].getText(fCol);
+                    if (fName && fName.indexOf("Ecomm BP") >= 0) {
+                        TEST_FORM_ID = parseInt(fResults[fi].getValue(fCol), 10);
+                        break;
+                    }
+                }
+            } catch (fErr) {
+                log.audit("TEST_SO_FORM", "Could not find Ecomm BP form: " + fErr.message);
+            }
+
+            var testCount = parseInt(payload.count, 10) || 1;
+            if (testCount > 10) testCount = 10;
+            var testResults = [];
+
+            try {
+                for (var tsi = 0; tsi < testCount; tsi++) {
+                    // Caller passes otherrefnum so PO can match it via website_order_number
+                    var testRef = (payload.otherrefnum)
+                        ? (testCount > 1 ? payload.otherrefnum + "-" + (tsi + 1) : payload.otherrefnum)
+                        : "TEST-SO-" + (tsi + 1);
+                    try {
+                        var tso = record.create({ type: record.Type.SALES_ORDER, isDynamic: true });
+
+                        if (TEST_FORM_ID) {
+                            tso.setValue({ fieldId: "customform", value: TEST_FORM_ID });
+                        }
+                        tso.setValue({ fieldId: "entity", value: TEST_CUSTOMER_ID });
+                        tso.setValue({ fieldId: "otherrefnum", value: testRef });
+                        tso.setValue({ fieldId: "trandate", value: new Date() });
+                        tso.setValue({ fieldId: "csegecomm_channel", value: TEST_CHANNEL_ID });
+
+                        tso.selectNewLine({ sublistId: "item" });
+                        tso.setCurrentSublistValue({ sublistId: "item", fieldId: "item", value: TEST_ITEM_ID });
+                        tso.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: 1 });
+                        tso.setCurrentSublistValue({ sublistId: "item", fieldId: "price", value: -1 });
+                        tso.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: 10.00 });
+                        tso.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: 10.00 });
+                        tso.commitLine({ sublistId: "item" });
+
+                        var savedId = tso.save({ enableSourcing: true, ignoreMandatoryFields: false });
+
+                        var savedRec = record.load({ type: record.Type.SALES_ORDER, id: savedId, isDynamic: false });
+                        var soNumber = savedRec.getValue({ fieldId: "tranid" });
+
+                        testResults.push({
+                            success: true,
+                            internalId: savedId,
+                            soNumber: soNumber,
+                            otherrefnum: testRef,
+                            item: TEST_SKU,
+                            itemId: TEST_ITEM_ID
+                        });
+
+                        log.audit("TEST_SO_CREATED", "ID=" + savedId + " SO#=" + soNumber + " ref=" + testRef);
+                    } catch (tsoErr) {
+                        testResults.push({
+                            success: false,
+                            otherrefnum: testRef,
+                            error: tsoErr.message
+                        });
+                        log.error("TEST_SO_FAIL", testRef + ": " + tsoErr.message);
+                    }
+                }
+
+                result.create_test_so = {
+                    requested: testCount,
+                    created: testResults.filter(function (r) { return r.success; }).length,
+                    config: {
+                        customer: "Amazon (ID: " + TEST_CUSTOMER_ID + ")",
+                        form: "Ecomm BP (ID: " + TEST_FORM_ID + ")",
+                        channel: "Amazon (ID: " + TEST_CHANNEL_ID + ")",
+                        item: TEST_SKU + " (ID: " + TEST_ITEM_ID + ")",
+                        location: "NOT SET (intentional for testing)"
+                    },
+                    orders: testResults
+                };
+            } catch (e) {
+                result.create_test_so = { error: e.message };
+            }
+        }
+
+        // ── Inspect SO line item fields (find PO linking fields) ──────────────
+        // POST: { "sections": ["so_line_inspect"], "soId": 250840 }
+        if (sections.indexOf("so_line_inspect") >= 0) {
+            var inspectSoId = parseInt(payload.soId, 10);
+            if (!inspectSoId) {
+                result.so_line_inspect = { error: "Missing soId" };
+            } else {
+                try {
+                    var soRec = record.load({ type: record.Type.SALES_ORDER, id: inspectSoId, isDynamic: false });
+                    var soLineCount = soRec.getLineCount({ sublistId: "item" });
+
+                    // Get ALL available sublist fields
+                    var sublistFields = [];
+                    try { sublistFields = soRec.getSublistFields({ sublistId: "item" }); } catch (e) {}
+
+                    var lines = [];
+                    for (var sli = 0; sli < soLineCount; sli++) {
+                        var lineData = { line: sli };
+                        for (var sfi = 0; sfi < sublistFields.length; sfi++) {
+                            var fid = sublistFields[sfi];
+                            try {
+                                var val = soRec.getSublistValue({ sublistId: "item", fieldId: fid, line: sli });
+                                if (val !== null && val !== "" && val !== undefined) {
+                                    lineData[fid] = val;
+                                    // Also get text for select fields
+                                    try {
+                                        var txt = soRec.getSublistText({ sublistId: "item", fieldId: fid, line: sli });
+                                        if (txt && txt !== String(val)) lineData[fid + "_text"] = txt;
+                                    } catch (e) {}
+                                }
+                            } catch (e) {}
+                        }
+                        lines.push(lineData);
+                    }
+
+                    // Also get header createdfrom if exists
+                    var headerInfo = {};
+                    try { headerInfo.createdfrom = soRec.getValue({ fieldId: "createdfrom" }); } catch (e) {}
+                    try { headerInfo.tranid = soRec.getValue({ fieldId: "tranid" }); } catch (e) {}
+                    try { headerInfo.otherrefnum = soRec.getValue({ fieldId: "otherrefnum" }); } catch (e) {}
+                    try { headerInfo.status = soRec.getValue({ fieldId: "status" }); } catch (e) {}
+
+                    result.so_line_inspect = {
+                        soId: inspectSoId,
+                        header: headerInfo,
+                        totalSublistFields: sublistFields.length,
+                        sublistFields: sublistFields,
+                        lineCount: soLineCount,
+                        lines: lines
+                    };
+                } catch (e) {
+                    result.so_line_inspect = { error: e.message };
+                }
+            }
+        }
+
+        // ── Delete Test SOs by internal IDs ──────────────────────────────────
+        // POST: { "sections": ["delete_test_so"], "soIds": [248008, 248010] }
+        if (sections.indexOf("delete_test_so") >= 0) {
+            var delSoIds = payload.soIds || [];
+            var delSoResults = [];
+            for (var dsi = 0; dsi < delSoIds.length; dsi++) {
+                try {
+                    record.delete({ type: record.Type.SALES_ORDER, id: parseInt(delSoIds[dsi], 10) });
+                    delSoResults.push({ id: delSoIds[dsi], deleted: true });
+                } catch (delErr) {
+                    delSoResults.push({ id: delSoIds[dsi], deleted: false, error: delErr.message });
+                }
+            }
+            result.delete_test_so = { requested: delSoIds.length, results: delSoResults };
+        }
+
+        // ── Cleanup: delete test SOs where otherrefnum starts with "TEST" ──
+        // POST: { "sections": ["cleanup_test_so"] }                    → dry-run (list only)
+        // POST: { "sections": ["cleanup_test_so"], "confirm": true }   → actually delete
+        if (sections.indexOf("cleanup_test_so") >= 0) {
+            log.debug("CLEANUP_TEST_SO", "Starting cleanup_test_so, confirm=" + !!payload.confirm);
+            try {
+                var testSoSearchResults = [];
+                search.create({
+                    type: search.Type.SALES_ORDER,
+                    filters: [
+                        ["otherrefnum", "startswith", "TEST"],
+                        "AND",
+                        ["mainline", "is", "T"]
+                    ],
+                    columns: ["internalid", "tranid", "otherrefnum"]
+                }).run().each(function (r) {
+                    testSoSearchResults.push({
+                        id: r.getValue("internalid"),
+                        soNumber: r.getValue("tranid"),
+                        otherrefnum: r.getValue("otherrefnum") || ""
+                    });
+                    return testSoSearchResults.length < 500;
+                });
+
+                log.debug("CLEANUP_TEST_SO", "Found " + testSoSearchResults.length + " test SOs");
+
+                if (!payload.confirm) {
+                    result.cleanup_test_so = {
+                        mode: "dry_run",
+                        found: testSoSearchResults.length,
+                        orders: testSoSearchResults,
+                        message: "Pass { \"confirm\": true } to delete these."
+                    };
+                } else {
+                    var soDeleted = 0;
+                    var soFailed = 0;
+                    var soDelDetails = [];
+                    for (var tsd = 0; tsd < testSoSearchResults.length; tsd++) {
+                        var tsoId = parseInt(testSoSearchResults[tsd].id, 10);
+                        try {
+                            record.delete({ type: record.Type.SALES_ORDER, id: tsoId });
+                            soDelDetails.push({ id: tsoId, deleted: true });
+                            soDeleted++;
+                        } catch (tsoErr) {
+                            soDelDetails.push({ id: tsoId, deleted: false, error: tsoErr.message });
+                            soFailed++;
+                        }
+                    }
+                    result.cleanup_test_so = {
+                        mode: "executed",
+                        found: testSoSearchResults.length,
+                        deleted: soDeleted,
+                        failed: soFailed,
+                        details: soDelDetails
+                    };
+                }
+            } catch (e) {
+                log.error("CLEANUP_TEST_SO_ERROR", e.name + ": " + e.message);
+                result.cleanup_test_so = { error: e.message };
+            }
+        }
+
+        // ── Cleanup: delete ALL Purchase Orders ─────────────────────────────
+        // POST: { "sections": ["cleanup_all_po"] }                    → dry-run (list only)
+        // POST: { "sections": ["cleanup_all_po"], "confirm": true }   → actually delete
+        if (sections.indexOf("cleanup_all_po") >= 0) {
+            log.debug("CLEANUP_ALL_PO", "Step 1: Starting cleanup_all_po, confirm=" + !!payload.confirm);
+            try {
+                log.debug("CLEANUP_ALL_PO", "Step 2: Creating PO search...");
+                var allPoSearch = search.create({
+                    type: search.Type.PURCHASE_ORDER,
+                    filters: [["mainline", "is", "T"]],
+                    columns: ["internalid", "tranid", "otherrefnum"]
+                });
+                log.debug("CLEANUP_ALL_PO", "Step 3: Search created, running...");
+                var allPoRunResults = allPoSearch.run();
+                log.debug("CLEANUP_ALL_PO", "Step 4: Run complete, iterating...");
+                var allPoSearchResults = [];
+                allPoRunResults.each(function (r) {
+                    log.debug("CLEANUP_ALL_PO", "Step 4a: Row — id=" + r.getValue("internalid") + " tranid=" + r.getValue("tranid"));
+                    allPoSearchResults.push({
+                        id: r.getValue("internalid"),
+                        poNumber: r.getValue("tranid"),
+                        otherrefnum: r.getValue("otherrefnum") || ""
+                    });
+                    return allPoSearchResults.length < 500;
+                });
+
+                log.debug("CLEANUP_ALL_PO", "Step 5: Found " + allPoSearchResults.length + " POs");
+
+                if (!payload.confirm) {
+                    result.cleanup_all_po = {
+                        mode: "dry_run",
+                        found: allPoSearchResults.length,
+                        orders: allPoSearchResults,
+                        message: "Pass { \"confirm\": true } to delete these."
+                    };
+                } else {
+                    var poDeleted = 0;
+                    var poFailed = 0;
+                    var poDelDetails = [];
+                    for (var pd = 0; pd < allPoSearchResults.length; pd++) {
+                        var delPoId = parseInt(allPoSearchResults[pd].id, 10);
+                        try {
+                            record.delete({ type: record.Type.PURCHASE_ORDER, id: delPoId });
+                            poDelDetails.push({ id: delPoId, deleted: true });
+                            poDeleted++;
+                        } catch (poDelErr) {
+                            poDelDetails.push({ id: delPoId, deleted: false, error: poDelErr.message });
+                            poFailed++;
+                        }
+                    }
+                    result.cleanup_all_po = {
+                        mode: "executed",
+                        found: allPoSearchResults.length,
+                        deleted: poDeleted,
+                        failed: poFailed,
+                        details: poDelDetails
+                    };
+                }
+            } catch (e) {
+                log.error("CLEANUP_ALL_PO_ERROR", e.name + ": " + e.message);
+                result.cleanup_all_po = { error: e.message };
+            }
         }
 
         log.audit("DIAGNOSTIC", "Sections: " + sections.join(", "));

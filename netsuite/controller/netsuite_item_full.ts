@@ -151,6 +151,13 @@ export async function runItemSublistsSync(batchSize = 50) {
     const nsDb = await getDb("netsuite");
     const col = nsDb.collection("netsuite_items_full");
 
+    // If collection is empty, run Phase 1 first to populate items
+    const docCount = await col.countDocuments();
+    if (docCount === 0) {
+        console.log("[ITEM-SUBLISTS] Collection empty — running Phase 1 (item full sync) first...");
+        await runItemFullSync();
+    }
+
     // Find inventory items that need sublists updated
     // Items without _sublists_at, or where _sublists_at is older than 1 hour
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);

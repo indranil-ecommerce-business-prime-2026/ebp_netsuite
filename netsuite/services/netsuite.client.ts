@@ -67,6 +67,17 @@ export const callDiagnostic = async (payload: object): Promise<any> => {
     return post(scriptId, deployId, payload);
 };
 
+// Cleanup RESTlet — lightweight script for deleting POs and test SOs
+export const callCleanup = async (payload: object): Promise<any> => {
+    const scriptId = process.env.RESTLET_CLEANUP_SCRIPT_ID;
+    const deployId = process.env.RESTLET_CLEANUP_DEPLOY_ID;
+    if (!scriptId || !deployId) {
+        console.error("[CLEANUP] Missing RESTLET_CLEANUP_SCRIPT_ID or RESTLET_CLEANUP_DEPLOY_ID in .env");
+        return null;
+    }
+    return post(scriptId, deployId, payload);
+};
+
 // Auth test — sends a minimal ping to the SO restlet
 export const testNetsuiteAuth = async (): Promise<void> => {
     try {

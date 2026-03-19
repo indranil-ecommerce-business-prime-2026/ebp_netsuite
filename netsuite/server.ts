@@ -6,7 +6,7 @@ import { syncSalesOrdersToNetsuite, retryFailedSalesOrders } from "./services/sa
 import { migrateSalesOrderSchema } from "./services/sales_order.migrate";
 import { stagePurchaseOrders } from "./services/po.stage";
 import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "./services/po.sync";
-import { callDiagnostic, postToNetsuite, postToNetsuiteForPO } from "./services/netsuite.client";
+import { callDiagnostic, callCleanup, postToNetsuite, postToNetsuiteForPO } from "./services/netsuite.client";
 import { syncNetsuiteItems } from "./controller/netsuite_item";
 import { syncNetsuitePOs } from "./controller/netsuite_po";
 import { syncNetsuiteItemsFull, runItemSublistsSync } from "./controller/netsuite_item_full";
@@ -147,6 +147,59 @@ app.post("/delete-all-so", async (req: any, res: any) => {
     }
 });
 
+// ─── Delete All Purchase Orders from NetSuite (via cleanup RESTlet) ──────────
+// GET  http://localhost:5002/delete-all-po            → dry-run (list POs)
+// POST http://localhost:5002/delete-all-po            → delete all POs
+app.get("/delete-all-po", async (_req: any, res: any) => {
+    console.log("[DELETE-PO] GET dry-run — calling cleanup RESTlet...");
+    try {
+        const result = await callCleanup({ action: "list_po" });
+        console.log("[DELETE-PO] Response:", JSON.stringify(result));
+        res.json(result);
+    } catch (e: any) {
+        console.error("[DELETE-PO] ERROR:", e?.response?.status, JSON.stringify(e?.response?.data), e.message);
+        res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
+app.post("/delete-all-po", async (_req: any, res: any) => {
+    console.log("[DELETE-PO] POST execute — looping batches via cleanup RESTlet...");
+    try {
+        let totalDeleted = 0;
+        let totalErrors = 0;
+        let batchNum = 0;
+        let done = false;
+
+        while (!done) {
+            batchNum++;
+            console.log(`[DELETE-PO] Batch ${batchNum}...`);
+            const result = await callCleanup({ action: "delete_po" });
+            const batch = result?.purchase_orders;
+
+            if (!batch) {
+                return res.status(500).json({ error: "No purchase_orders in response", raw: result });
+            }
+
+            totalDeleted += batch.deleted || 0;
+            totalErrors += batch.errors || 0;
+            done = batch.done || (batch.deleted === 0 && batch.remaining <= 0);
+
+            console.log(`[DELETE-PO] Batch ${batchNum}: deleted ${batch.deleted}, errors ${batch.errors}, remaining ~${batch.remaining}`);
+        }
+
+        console.log(`[DELETE-PO] Done. Total deleted: ${totalDeleted}, errors: ${totalErrors}, batches: ${batchNum}`);
+        res.json({
+            success: true,
+            total_deleted: totalDeleted,
+            total_errors: totalErrors,
+            batches: batchNum,
+        });
+    } catch (e: any) {
+        console.error("[DELETE-PO] ERROR:", e?.response?.status, JSON.stringify(e?.response?.data), e.message);
+        res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
 // ─── Direct PO RESTlet call (for testing) ────────────────────────────────────
 app.post("/po-test", async (req: any, res: any) => {
     try {
@@ -198,6 +251,150 @@ app.get("/netsuite-po", syncNetsuitePOs);
 // GET http://localhost:5002/netsuite-items-full?sublists=true           → + Location/Vendor sublists
 app.get("/netsuite-items-full", syncNetsuiteItemsFull);
 
+// ─── Cleanup: delete test SOs + all POs (via cleanup RESTlet) ────────────────
+// GET  http://localhost:5002/cleanup          → dry-run (list what will be deleted)
+// POST http://localhost:5002/cleanup          → actually delete
+app.get("/cleanup", async (_req: any, res: any) => {
+    try {
+        const result = await callCleanup({ action: "list_all" });
+        res.json(result);
+    } catch (e: any) {
+        res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
+app.post("/cleanup", async (_req: any, res: any) => {
+    try {
+        let totalDeletedPO = 0, totalDeletedSO = 0;
+        let batchNum = 0;
+        let poDone = false, soDone = false;
+
+        while (!poDone || !soDone) {
+            batchNum++;
+            console.log(`[CLEANUP] Batch ${batchNum}...`);
+            const result = await callCleanup({ action: "delete_all" });
+
+            const po = result?.purchase_orders;
+            const so = result?.test_sales_orders;
+
+            if (po) {
+                totalDeletedPO += po.deleted || 0;
+                poDone = po.done || (po.deleted === 0 && po.remaining <= 0);
+            } else { poDone = true; }
+
+            if (so) {
+                totalDeletedSO += so.deleted || 0;
+                soDone = so.done || (so.deleted === 0 && so.remaining <= 0);
+            } else { soDone = true; }
+
+            console.log(`[CLEANUP] Batch ${batchNum}: PO deleted ${po?.deleted || 0} (remaining ~${po?.remaining || 0}), SO deleted ${so?.deleted || 0} (remaining ~${so?.remaining || 0})`);
+        }
+
+        res.json({
+            success: true,
+            total_deleted_po: totalDeletedPO,
+            total_deleted_so: totalDeletedSO,
+            batches: batchNum,
+        });
+    } catch (e: any) {
+        res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
+// ─── Test PO Flow — end-to-end: create SO (diagnostic) → create PO + update SO (PO RESTlet) ──
+// POST http://localhost:5002/test-po-flow?type=dropship    → Dropship PO + SO location update
+// POST http://localhost:5002/test-po-flow?type=stocking    → Stocking PO (no SO link)
+app.post("/test-po-flow", async (req: any, res: any) => {
+    try {
+        const poType = req.query.type || "dropship";
+
+        // Step 1: Create 1 test SO via diagnostic RESTlet (no location on items)
+        // Pass a predictable otherrefnum so the PO can match it via website_order_number
+        const testId = "TEST-SO-" + 987654321; // ← use a fixed test ID for easy tracking
+        console.log("[TEST-PO-FLOW] Step 1 — Creating test SO via diagnostic (otherrefnum: " + testId + ")...");
+        const soResult = await callDiagnostic({
+            sections: ["create_test_so"],
+            count: 1,
+            otherrefnum: testId,
+        });
+
+        const createdSO = soResult?.create_test_so?.orders?.[0];
+        if (!createdSO?.success) {
+            return res.status(500).json({
+                success: false,
+                step: "create_test_so",
+                error: createdSO?.error || "Failed to create test SO",
+                soResult,
+            });
+        }
+
+        console.log(`[TEST-PO-FLOW] SO created: ${createdSO.soNumber} (ID ${createdSO.internalId}, otherrefnum: ${createdSO.otherrefnum})`);
+
+        // Step 2: Send PO to PO RESTlet with website_order_number = SO's otherrefnum
+        const testPoNum = Date.now();
+        const poPayload: any = {
+            action:   "update",
+            po_type:  poType === "stocking" ? "Stocking" : "Dropship",
+        };
+
+        if (poType === "stocking") {
+            Object.assign(poPayload, {
+                po_number:                testPoNum,
+                otherrefnum:              String(testPoNum),
+                vendor_id:                117,
+                distributor:              "Synnex",
+                distributor_order_number: "159016653",
+                status:                   "Open PO",
+                invoice:                  [],
+                tracking:                 null,
+                website_order_number:     "",
+                stocking_warehouse:       "W2G-IL",
+                order_items: [
+                    { sku: "29S0500", qty: 80, cost: 487.74 },
+                    { sku: "29S0100", qty: 80, cost: 346.16 },
+                    { sku: "40N9020", qty: 50, cost: 299.54 },
+                    { sku: "40N9070", qty: 20, cost: 452.07 },
+                ],
+            });
+        } else {
+            // Dropship — link to the test SO we just created
+            Object.assign(poPayload, {
+                po_number:                testPoNum,
+                otherrefnum:              String(testPoNum),
+                vendor_id:                131,
+                distributor:              "suppliesnetwork",
+                distributor_order_number: "322209601",
+                status:                   "Open PO",
+                invoice:                  [],
+                tracking:                 null,
+                website_order_number:     testId,  // ← PO only knows this from its own data, finds SO by matching otherrefnum
+                stocking_warehouse:       "",
+                order_items: [
+                    { sku: "29S0100", qty: 2, cost: 68.81 },
+                ],
+            });
+        }
+
+        console.log(`[TEST-PO-FLOW] Step 2 — Sending ${poPayload.po_type} PO ${poPayload.po_number} (website_order_number: ${poPayload.website_order_number})...`);
+        const poResult = await postToNetsuiteForPO(poPayload);
+
+        console.log(`[TEST-PO-FLOW] Done. PO action: ${poResult?.action}, SO update: ${JSON.stringify(poResult?.soUpdate)}`);
+
+        res.json({
+            success: true,
+            type: poType,
+            so: {
+                soNumber:     createdSO.soNumber,
+                internalId:   createdSO.internalId,
+                otherrefnum:  createdSO.otherrefnum,
+            },
+            po: poResult,
+        });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e?.response?.data || e.message });
+    }
+});
+
 const PORT = 5002;
 app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
@@ -217,13 +414,13 @@ app.listen(PORT, () => {
 });
 
 // ─── CRON: Every 30 mins — Sales Orders ──────────────────────────────────────
-cron.schedule("*/30 * * * *", async () => {
-    console.log("[CRON] [SO] Step 1 — Staging sales orders...");
-    await stageSalesOrders();
+// cron.schedule("*/30 * * * *", async () => {
+//     console.log("[CRON] [SO] Step 1 — Staging sales orders...");
+//     await stageSalesOrders();
 
-    console.log("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-    await syncSalesOrdersToNetsuite();
-});
+//     console.log("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+//     await syncSalesOrdersToNetsuite();
+// });
 
 // // ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
 // cron.schedule("*/30 * * * *", async () => {
