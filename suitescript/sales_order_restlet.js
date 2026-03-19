@@ -80,7 +80,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var fulfillment_channel = payload.fulfillment_channel || "";
             var ship_date           = payload.ship_date;
             var items               = payload.items;
-
+            
             if (!otherrefnum) {
                 return { success: false, error: "Missing otherrefnum" };
             }
