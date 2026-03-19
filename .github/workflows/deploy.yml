@@ -17,7 +17,8 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /ebpconsole/ebp_netsuite
-            git fetch origin
-            git reset --hard origin/main
+            git stash
+            git pull origin
+            # git reset --hard origin/main
             npm install
             pm2 reload vg_netsuite
