@@ -6,7 +6,7 @@ import { syncSalesOrdersToNetsuite, retryFailedSalesOrders } from "./services/sa
 import { migrateSalesOrderSchema } from "./services/sales_order.migrate";
 import { stagePurchaseOrders } from "./services/po.stage";
 import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "./services/po.sync";
-import { callDiagnostic, callCleanup, postToNetsuite, postToNetsuiteForPO } from "./services/netsuite.client";
+import { callDiagnostic, callCleanup, postToNetsuite, postToNetsuiteForPO, postToNetsuiteForBill } from "./services/netsuite.client";
 import { syncNetsuiteItems } from "./controller/netsuite_item";
 import { syncNetsuitePOs } from "./controller/netsuite_po";
 import { syncNetsuiteItemsFull, runItemSublistsSync } from "./controller/netsuite_item_full";
@@ -197,6 +197,35 @@ app.post("/delete-all-po", async (_req: any, res: any) => {
     } catch (e: any) {
         console.error("[DELETE-PO] ERROR:", e?.response?.status, JSON.stringify(e?.response?.data), e.message);
         res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
+// ─── Direct Bill RESTlet call (for testing) ──────────────────────────────────
+app.post("/bill-test", async (req: any, res: any) => {
+    try {
+        const result = await postToNetsuiteForBill(req.body);
+        res.json(result);
+    } catch (e: any) {
+        res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
+// ─── Test Bill Flow — find a PO and create a bill from it ────────────────────
+// GET http://localhost:5002/test-bill-flow              → uses demo PO# 987612345
+// GET http://localhost:5002/test-bill-flow?po=10001     → custom PO otherrefnum
+app.get("/test-bill-flow", async (req: any, res: any) => {
+    try {
+        const poNumber = req.query.po || "987612345";
+        const result = await postToNetsuiteForBill({
+            action:         "create",
+            po_number:      poNumber,
+            invoice_number: "INV-TEST-" + Date.now(),
+            invoice_date:   new Date().toISOString().split("T")[0],
+            memo:           "Test bill created from PO " + poNumber,
+        });
+        res.json({ success: true, ...result });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e?.response?.data || e.message });
     }
 });
 
@@ -404,6 +433,8 @@ app.listen(PORT, () => {
     console.log(`Retry Failed SO: http://localhost:${PORT}/retry-failed-so`);
     console.log(`Delete All SO:   GET  http://localhost:${PORT}/delete-all-so  (dry-run)`);
     console.log(`                 POST http://localhost:${PORT}/delete-all-so  (execute)`);
+    console.log(`Bill Test:       POST http://localhost:${PORT}/bill-test`);
+    console.log(`Test Bill Flow:  GET  http://localhost:${PORT}/test-bill-flow?po=987612345`);
     console.log(`PO Test:         POST http://localhost:${PORT}/po-test`);
     console.log(`Sync PO:         GET  http://localhost:${PORT}/sync-po`);
     console.log(`Retry Failed PO: GET  http://localhost:${PORT}/retry-failed-po`);

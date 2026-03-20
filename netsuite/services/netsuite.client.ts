@@ -56,6 +56,10 @@ export const postToNetsuite = (payload: object) =>
 export const postToNetsuiteForPO = (payload: object) =>
     post(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!, payload);
 
+// Vendor Bill restlet
+export const postToNetsuiteForBill = (payload: object) =>
+    post(process.env.RESTLET_BILL_SCRIPT_ID!, process.env.RESTLET_BILL_DEPLOY_ID!, payload);
+
 // Diagnostic RESTlet — call with sections to inspect account config
 export const callDiagnostic = async (payload: object): Promise<any> => {
     const scriptId = process.env.RESTLET_DIAG_SCRIPT_ID;
