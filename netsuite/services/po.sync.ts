@@ -1,9 +1,10 @@
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuiteForPO } from "./netsuite.client";
 import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import log from "../config/logger.config";
 
 export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
-    console.log(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, stopOnError: ${STOP_ON_ERROR}`);
+    log.info(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, stopOnError: ${STOP_ON_ERROR}`);
 
     const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_purchase_order");
@@ -19,7 +20,7 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
     const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
 
     if (orders.length === 0) {
-        console.log("[NS PO Sync] No unsynced purchase orders. Skipping.");
+        log.info("[NS PO Sync] No unsynced purchase orders. Skipping.");
         return [];
     }
 
@@ -28,10 +29,10 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
     let skipped = 0;
     const results: any[] = [];
 
-    console.log(`[NS PO Sync] Found ${orders.length} POs to process${TEST_MODE ? " (TEST MODE)" : ""}`);
+    log.info(`[NS PO Sync] Found ${orders.length} POs to process${TEST_MODE ? " (TEST MODE)" : ""}`);
 
     for (const po of orders) {
-        console.log(`[NS PO Sync] Sending PO: ${po.po_number}`);
+        log.info(`[NS PO Sync] Sending PO: ${po.po_number}`);
         try {
             const result = await postToNetsuiteForPO({
                 action:                   SYNC_MODE,
@@ -58,19 +59,19 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
                     { _id: po._id },
                     { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
                 );
-                console.log(`[NS PO Sync] No matching items — marked & skipped: ${po.po_number}`);
+                log.info(`[NS PO Sync] No matching items — marked & skipped: ${po.po_number}`);
                 skipped++;
                 continue;
             }
 
             // If NetSuite returned success: false
             if (result.success === false) {
-                console.error(`[NS PO Sync] Failed in NetSuite: ${po.po_number} → ${result.error}`);
+                log.error(`[NS PO Sync] Failed in NetSuite: ${po.po_number} → ${result.error}`);
                 await markFailed(collection, po, result.error);
                 errors++;
 
                 if (STOP_ON_ERROR) {
-                    console.error(`[NS PO Sync] STOP_ON_ERROR is true — halting batch.`);
+                    log.error(`[NS PO Sync] STOP_ON_ERROR is true — halting batch.`);
                     break;
                 }
                 continue;
@@ -84,7 +85,7 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
                     $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
                 }
             );
-            console.log(`[NS PO Sync] Synced & marked: ${po.po_number} → ${result.action}`);
+            log.info(`[NS PO Sync] Synced & marked: ${po.po_number} → ${result.action}`);
 
             if (result.action === "skipped") {
                 skipped++;
@@ -93,24 +94,24 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
 
             sent++;
             if (TEST_MODE) {
-                console.log(`[NS PO Sync] TEST_MODE — stopping after first insert/update`);
+                log.info(`[NS PO Sync] TEST_MODE — stopping after first insert/update`);
                 break;
             }
         } catch (e: any) {
             const errMsg = e?.response?.data || e.message;
-            console.error(`[NS PO Sync] Failed for PO ${po.po_number}:`, errMsg);
+            log.error(`[NS PO Sync] Failed for PO ${po.po_number}:`, errMsg);
             results.push({ po_number: po.po_number, success: false, error: errMsg });
             await markFailed(collection, po, errMsg);
             errors++;
 
             if (STOP_ON_ERROR) {
-                console.error(`[NS PO Sync] STOP_ON_ERROR is true — halting batch.`);
+                log.error(`[NS PO Sync] STOP_ON_ERROR is true — halting batch.`);
                 break;
             }
         }
     }
 
-    console.log(`[NS PO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    log.info(`[NS PO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
     return results;
 };
 
@@ -130,7 +131,7 @@ async function markFailed(collection: any, order: any, error: any) {
 
     if (permanentlyFailed) {
         update.$set.ns_failed = true;
-        console.error(`[NS PO Sync] PO ${order.po_number} exceeded ${MAX_RETRIES} retries — marked as permanently failed.`);
+        log.error(`[NS PO Sync] PO ${order.po_number} exceeded ${MAX_RETRIES} retries — marked as permanently failed.`);
     }
 
     await collection.updateOne({ _id: order._id }, update);
