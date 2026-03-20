@@ -182,47 +182,72 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         return null;
     }
 
-    // ── Update linked SO line item locations for Dropship POs ───────────
-    function updateSOLocationForDropship(websiteOrderNumber, dropshipLocationId) {
-        if (!websiteOrderNumber) return { found: false, reason: "no website_order_number" };
-
-        var soIdCol = search.createColumn({ name: "internalid" });
-        var soTranCol = search.createColumn({ name: "tranid" });
-        var soResults = search.create({
-            type: search.Type.SALES_ORDER,
-            filters: [
-                ["poastext", "is", websiteOrderNumber],
-                "AND",
-                ["mainline", "is", "T"]
-            ],
-            columns: [soIdCol, soTranCol]
-        }).run().getRange({ start: 0, end: 1 });
-
-        if (soResults.length === 0) {
-            log.debug("SO_NOT_FOUND", "No SO with poastext: " + websiteOrderNumber);
-            return { found: false, reason: "SO not found for poastext: " + websiteOrderNumber };
-        }
-
-        var soId = parseInt(soResults[0].getValue(soIdCol), 10);
-        var soTranId = soResults[0].getValue(soTranCol);
-        log.debug("SO_FOUND", "Loading SO ID " + soId + " (" + soTranId + ") to update line locations");
+    // ── Update SO line locations to Dropship ─────────────────────────────
+    // Sets location=Dropship on each SO line item. Needed for correct
+    // fulfillment routing. Idempotent — skips lines already set.
+    function updateSOLocationForDropship(soId, dropshipLocationId) {
+        if (!soId) return { success: false, reason: "no soId provided" };
 
         var so = record.load({ type: record.Type.SALES_ORDER, id: soId, isDynamic: true });
         var lineCount = so.getLineCount({ sublistId: "item" });
+        var linesChanged = 0;
+
+        var soStatus = so.getValue({ fieldId: "status" });
+        log.debug("SO_STATUS", "SO " + soId + " status=" + soStatus);
 
         for (var i = 0; i < lineCount; i++) {
             so.selectLine({ sublistId: "item", line: i });
-            so.setCurrentSublistValue({
-                sublistId: "item", fieldId: "location",
-                value: dropshipLocationId, ignoreFieldChange: false
-            });
+
+            if (dropshipLocationId) {
+                var currentLoc = so.getCurrentSublistValue({ sublistId: "item", fieldId: "location" });
+                if (String(currentLoc) !== String(dropshipLocationId)) {
+                    so.setCurrentSublistValue({
+                        sublistId: "item", fieldId: "location",
+                        value: dropshipLocationId, ignoreFieldChange: false
+                    });
+                    linesChanged++;
+                }
+            }
+
             so.commitLine({ sublistId: "item" });
         }
 
-        var savedSoId = so.save({ enableSourcing: true, ignoreMandatoryFields: true });
-        log.debug("SO_UPDATED", "SO ID " + savedSoId + " — " + lineCount + " lines updated to Dropship location");
+        if (linesChanged === 0) {
+            log.debug("SO_LOC_SKIP", "All " + lineCount + " lines already set to Dropship — skipping save");
+            return { success: true, soId: soId, linesChanged: 0, soStatus: soStatus };
+        }
 
-        return { found: true, soId: savedSoId, soNumber: soTranId, linesUpdated: lineCount };
+        var savedSoId = so.save({ enableSourcing: true, ignoreMandatoryFields: true });
+        log.debug("SO_LOC_SAVED", "SO " + savedSoId + " — " + linesChanged + "/" + lineCount + " lines updated to Dropship");
+
+        return { success: true, soId: savedSoId, linesChanged: linesChanged, soStatus: soStatus };
+    }
+
+    // ── Find PO linked to SO via createdfrom ─────────────────────────────
+    function findLinkedPO(soId) {
+        var idCol = search.createColumn({ name: "internalid", sort: search.Sort.DESC });
+        var tranCol = search.createColumn({ name: "tranid" });
+
+        var results = search.create({
+            type: search.Type.PURCHASE_ORDER,
+            filters: [
+                ["createdfrom", "anyof", [soId]],
+                "AND",
+                ["mainline", "is", "T"]
+            ],
+            columns: [idCol, tranCol]
+        }).run().getRange({ start: 0, end: 5 });
+
+        if (results.length === 0) return null;
+
+        if (results.length > 1) {
+            log.audit("LINKED_PO_MULTIPLE", "Found " + results.length + " POs linked to SO " + soId + " — using newest");
+        }
+
+        return {
+            id: parseInt(results[0].getValue(idCol), 10),
+            poNumber: results[0].getValue(tranCol)
+        };
     }
 
     // ── Main POST handler ───────────────────────────────────────────────
@@ -263,9 +288,11 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             // ── For Dropship: find linked SO before creating PO ───────────────
             var linkedSoId = null;
             var linkedSoNumber = null;
+            var linkedSoCustomerId = null;
             if (po_type === "Dropship" && website_order_number) {
                 var soIdCol = search.createColumn({ name: "internalid" });
                 var soTranCol = search.createColumn({ name: "tranid" });
+                var soCustCol = search.createColumn({ name: "entity" });
                 var soLookup = search.create({
                     type: search.Type.SALES_ORDER,
                     filters: [
@@ -273,13 +300,14 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         "AND",
                         ["mainline", "is", "T"]
                     ],
-                    columns: [soIdCol, soTranCol]
+                    columns: [soIdCol, soTranCol, soCustCol]
                 }).run().getRange({ start: 0, end: 1 });
 
                 if (soLookup.length > 0) {
                     linkedSoId = parseInt(soLookup[0].getValue(soIdCol), 10);
                     linkedSoNumber = soLookup[0].getValue(soTranCol);
-                    log.debug("LINKED_SO", "Found SO " + linkedSoNumber + " (ID " + linkedSoId + ") for website_order_number: " + website_order_number);
+                    linkedSoCustomerId = parseInt(soLookup[0].getValue(soCustCol), 10);
+                    log.debug("LINKED_SO", "Found SO " + linkedSoNumber + " (ID " + linkedSoId + ", customer " + linkedSoCustomerId + ") for website_order_number: " + website_order_number);
                 } else {
                     log.debug("LINKED_SO", "No SO found for website_order_number: " + website_order_number);
                 }
@@ -288,21 +316,47 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             // ── Build record ─────────────────────────────────────────────────
             var po;
             var isUpdate = false;
-            var transformedFromSO = false;
+            var isDropshipCreate = false;
+            var soSetupResult = null;
+            var autoPOInfo = null;
 
-            if (existing && action === "update") {
+            if (po_type === "Dropship" && linkedSoId) {
+                // ── DROPSHIP: Update SO location → Create linked PO ──────────
+                // Step 1: Update SO line locations to "Dropship"
+                var dropshipLocId = findLocationByName("Dropship");
+                soSetupResult = updateSOLocationForDropship(linkedSoId, dropshipLocId);
+                log.debug("SO_LOC_RESULT", JSON.stringify(soSetupResult));
+
+                // Step 2: Check if a PO already exists for this SO
+                autoPOInfo = findLinkedPO(linkedSoId);
+
+                if (autoPOInfo) {
+                    // PO already linked — load for update
+                    log.debug("LINKED_PO_FOUND", "PO " + autoPOInfo.poNumber + " (ID " + autoPOInfo.id + ") already linked to SO " + linkedSoNumber);
+                    po = record.load({ type: record.Type.PURCHASE_ORDER, id: autoPOInfo.id, isDynamic: true });
+                    isUpdate = true;
+                } else {
+                    // Step 3: Create PO linked to SO via defaultValues.soid
+                    // (SuiteAnswers 71358 — the only way to set createdfrom on a PO)
+                    log.debug("DROPSHIP_CREATE", "Creating linked dropship PO for SO " + linkedSoNumber + " (customer " + linkedSoCustomerId + ", vendor " + vendor_id + ")");
+                    po = record.create({
+                        type: record.Type.PURCHASE_ORDER,
+                        isDynamic: true,
+                        defaultValues: {
+                            soid: linkedSoId,
+                            dropship: "T",
+                            custid: linkedSoCustomerId,
+                            entity: parseInt(vendor_id, 10),
+                            poentity: parseInt(vendor_id, 10)
+                        }
+                    });
+                    isDropshipCreate = true;
+                }
+
+            } else if (existing && action === "update") {
                 po = record.load({ type: record.Type.PURCHASE_ORDER, id: existing.id, isDynamic: true });
                 isUpdate = true;
-            } else if (linkedSoId) {
-                // Dropship: transform SO → PO (creates native createdfrom link)
-                po = record.transform({
-                    fromType: record.Type.SALES_ORDER,
-                    fromId: linkedSoId,
-                    toType: record.Type.PURCHASE_ORDER,
-                    isDynamic: true
-                });
-                transformedFromSO = true;
-                log.debug("TRANSFORM", "Created PO from SO " + linkedSoNumber + " (ID " + linkedSoId + ")");
+
             } else {
                 po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
             }
@@ -416,44 +470,42 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var linesAdded = 0;
             var linesUpdated = 0;
 
-            if (transformedFromSO && resolvedItems.length > 0) {
-                // ── DROPSHIP TRANSFORM MODE ────────────────────────────────────
-                // Transform copied SO lines → try to match by item ID and update
-                // in place to preserve the native SO↔PO line-level link.
+            if (isDropshipCreate && oldLineCount > 0) {
+                // ── DROPSHIP: Lines auto-populated from SO via defaultValues.soid ──
+                // Update existing lines in-place (qty, rate, location) to preserve
+                // the native SO↔PO line-level link.
+                log.debug("DROPSHIP_LINES", "Auto-populated " + oldLineCount + " lines from SO — updating in-place");
 
-                // Build map of existing lines: itemId → line index
-                var existingLineMap = {};   // itemId → [line indices]
+                // Build map: itemId → [line indices] for matching
+                var existingLineMap = {};
                 for (var eli = 0; eli < oldLineCount; eli++) {
                     var existItemId = po.getSublistValue({ sublistId: "item", fieldId: "item", line: eli });
-                    var key = String(existItemId);
-                    if (!existingLineMap[key]) existingLineMap[key] = [];
-                    existingLineMap[key].push(eli);
+                    var mapKey = String(existItemId);
+                    if (!existingLineMap[mapKey]) existingLineMap[mapKey] = [];
+                    existingLineMap[mapKey].push(eli);
                 }
-                log.debug("TRANSFORM_LINES", "Old lines: " + oldLineCount + ", map: " + JSON.stringify(existingLineMap));
 
-                var matchedLineIndices = {};  // tracks which old lines were matched
-                var unmatchedItems = [];      // PO items that didn't match any transform line
+                var matchedLines = {};
+                var unmatchedItems = [];
 
-                // Step 1: Match and update existing lines in place
+                // Match resolved items to auto-populated lines by item ID
                 for (var mi = 0; mi < resolvedItems.length; mi++) {
                     var poItem = resolvedItems[mi];
-                    var matchKey = String(poItem.itemId);
+                    var itemKey = String(poItem.itemId);
                     var matchedLine = -1;
 
-                    // Find an unmatched existing line with the same item ID
-                    if (existingLineMap[matchKey]) {
-                        for (var mli = 0; mli < existingLineMap[matchKey].length; mli++) {
-                            var candidateLine = existingLineMap[matchKey][mli];
-                            if (!matchedLineIndices[candidateLine]) {
-                                matchedLine = candidateLine;
-                                matchedLineIndices[candidateLine] = true;
+                    if (existingLineMap[itemKey]) {
+                        for (var mli = 0; mli < existingLineMap[itemKey].length; mli++) {
+                            var candidate = existingLineMap[itemKey][mli];
+                            if (!matchedLines[candidate]) {
+                                matchedLine = candidate;
+                                matchedLines[candidate] = true;
                                 break;
                             }
                         }
                     }
 
                     if (matchedLine >= 0) {
-                        // UPDATE in place — preserves SO↔PO line link
                         try {
                             po.selectLine({ sublistId: "item", line: matchedLine });
                             po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: poItem.qty, ignoreFieldChange: false });
@@ -469,12 +521,11 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                             unmatchedItems.push(poItem);
                         }
                     } else {
-                        // No matching transform line — add as new
                         unmatchedItems.push(poItem);
                     }
                 }
 
-                // Step 2: Add unmatched items as new lines
+                // Add any unmatched items as new lines
                 for (var ui = 0; ui < unmatchedItems.length; ui++) {
                     var newItem = unmatchedItems[ui];
                     try {
@@ -487,34 +538,28 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: newItem.cost, ignoreFieldChange: false });
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
-                        log.debug("LINE_ADDED_NEW", "SKU \"" + newItem.sku + "\" (no transform match) → lines now: " + po.getLineCount({ sublistId: "item" }));
                     } catch (addErr) {
                         log.error("LINE_ADD_ERR", "SKU \"" + newItem.sku + "\" — " + addErr.message);
                         skippedSkus.push(newItem.sku);
                     }
                 }
 
-                // Step 3: Remove unmatched OLD lines (transform lines that have no PO item)
-                // Collect indices in reverse order to avoid index shift
+                // Remove unmatched auto-populated lines (not in our order_items) in reverse
                 var linesToRemove = [];
                 for (var rli = 0; rli < oldLineCount; rli++) {
-                    if (!matchedLineIndices[rli]) {
-                        linesToRemove.push(rli);
-                    }
+                    if (!matchedLines[rli]) linesToRemove.push(rli);
                 }
                 if (linesToRemove.length > 0) {
-                    log.debug("REMOVE_UNMATCHED", "Removing " + linesToRemove.length + " unmatched transform lines: " + JSON.stringify(linesToRemove));
+                    log.debug("REMOVE_UNMATCHED", "Removing " + linesToRemove.length + " auto-populated lines not in order_items");
                     for (var rmi = linesToRemove.length - 1; rmi >= 0; rmi--) {
                         po.removeLine({ sublistId: "item", line: linesToRemove[rmi] });
                     }
                 }
 
-                log.debug("TRANSFORM_RESULT", "Updated: " + linesUpdated + ", Added: " + linesAdded + ", Removed: " + linesToRemove.length);
+                log.debug("DROPSHIP_LINE_RESULT", "Updated: " + linesUpdated + ", Added: " + linesAdded + ", Removed: " + linesToRemove.length);
 
             } else {
-                // ── STANDARD MODE (Stocking / create / update) ─────────────────
-                // Add-first, remove-old strategy (no SO link to preserve)
-
+                // ── STANDARD: Add-first, remove-old strategy ───────────────────
                 for (var i = 0; i < resolvedItems.length; i++) {
                     var stdItem = resolvedItems[i];
                     try {
@@ -569,21 +614,9 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var savedId = po.save({ enableSourcing: true, ignoreMandatoryFields: true });
             log.debug("SUCCESS", "PO " + po_number + " saved → ID: " + savedId);
 
-            // ── Dropship: update linked SO line item locations ───────────────
-            var soUpdate = null;
-            if (po_type === "Dropship" && website_order_number && locationId) {
-                try {
-                    soUpdate = updateSOLocationForDropship(website_order_number, locationId);
-                    log.debug("SO_UPDATE_RESULT", JSON.stringify(soUpdate));
-                } catch (soErr) {
-                    log.error("SO_UPDATE_ERROR", soErr.message);
-                    soUpdate = { error: soErr.message };
-                }
-            }
-
             return {
                 success: true,
-                action: isUpdate ? "updated" : "created",
+                action: isUpdate ? "updated" : (isDropshipCreate ? "created_dropship" : "created"),
                 po_number: po_number,
                 internalId: savedId,
                 linesAdded: linesAdded,
@@ -591,8 +624,9 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 locationId: locationId,
                 po_type: po_type,
                 skippedSkus: skippedSkus.length > 0 ? skippedSkus : undefined,
-                soUpdate: soUpdate,
-                linkedSo: linkedSoId ? { id: linkedSoId, soNumber: linkedSoNumber, transformedFromSO: transformedFromSO } : null,
+                soSetup: soSetupResult,
+                autoPO: autoPOInfo,
+                linkedSo: linkedSoId ? { id: linkedSoId, soNumber: linkedSoNumber } : null,
                 before: before, after: after, diff: diff
             };
 

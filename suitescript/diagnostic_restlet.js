@@ -1383,8 +1383,15 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
                     }
                 }
 
+                // ── Incremental sync: optional modifiedSince filter ──
+                // POST: { "sections": ["fetch_items_fast"], "modifiedSince": "2026-03-20 00:00:00" }
+                var fiqModFilter = "";
+                if (payload.modifiedSince) {
+                    fiqModFilter = " AND i.lastmodifieddate >= '" + payload.modifiedSince + "'";
+                }
+
                 // ── Get total count first ──
-                var fiqCountSql = "SELECT COUNT(*) AS cnt FROM item i WHERE i.isinactive = 'F'";
+                var fiqCountSql = "SELECT COUNT(*) AS cnt FROM item i WHERE i.isinactive = 'F'" + fiqModFilter;
                 var fiqCountResult = query.runSuiteQL({ query: fiqCountSql });
                 var fiqTotal = 0;
                 if (fiqCountResult && fiqCountResult.results && fiqCountResult.results.length > 0) {
@@ -1405,7 +1412,7 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
                     var fiqSkipped = [];
                     var fiqItems = [];
 
-                    var fiqBaseSql = " FROM item i WHERE i.isinactive = 'F' ORDER BY i.id";
+                    var fiqBaseSql = " FROM item i WHERE i.isinactive = 'F'" + fiqModFilter + " ORDER BY i.id";
                     var fiqPageSql = " OFFSET " + fiqOffset + " ROWS FETCH NEXT " + fiqPageSize + " ROWS ONLY";
 
                     // Attempt 1: full query
@@ -1540,30 +1547,33 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
 
         // ── Fetch Item Sublists (Locations + Vendors via record.load) ─────────
         // POST: { "sections": ["fetch_item_sublists"], "itemIds": [123, 456, 789] }
-        // Loads each item record and extracts Location + Vendor sublist data.
-        // Max 50 items per call (governance: record.load = 10 units each).
+        // POST: { "sections": ["fetch_item_sublists"], "itemIds": [123, 456], "itemTypes": {"123":"SerializedInventoryItem","456":"InvtPart"} }
+        // When itemTypes map is provided, loads directly by type (5 units each).
+        // Without itemTypes, falls back to try/catch (10 units worst case).
+        // Max 800 items per call (governance: 800 × 5 = 4,000 units, leaving 1,000 buffer).
         if (sections.indexOf("fetch_item_sublists") >= 0) {
             var slItemIds = payload.itemIds || [];
-            if (slItemIds.length > 50) slItemIds = slItemIds.slice(0, 50);
+            var slItemTypes = payload.itemTypes || {};  // { "123": "SerializedInventoryItem", "456": "InvtPart" }
+            if (slItemIds.length > 800) slItemIds = slItemIds.slice(0, 800);
 
             var slResults = [];
             for (var sli = 0; sli < slItemIds.length; sli++) {
                 var slId = slItemIds[sli];
                 try {
-                    // Try serialized first (most items in this account), fall back to inventory
                     var slRec;
-                    try {
-                        slRec = record.load({
-                            type: record.Type.SERIALIZED_INVENTORY_ITEM,
-                            id: parseInt(slId, 10),
-                            isDynamic: false
-                        });
-                    } catch (serErr) {
-                        slRec = record.load({
-                            type: record.Type.INVENTORY_ITEM,
-                            id: parseInt(slId, 10),
-                            isDynamic: false
-                        });
+                    var slType = slItemTypes[String(slId)];
+
+                    if (slType === "SerializedInventoryItem") {
+                        slRec = record.load({ type: record.Type.SERIALIZED_INVENTORY_ITEM, id: parseInt(slId, 10), isDynamic: false });
+                    } else if (slType === "InvtPart") {
+                        slRec = record.load({ type: record.Type.INVENTORY_ITEM, id: parseInt(slId, 10), isDynamic: false });
+                    } else {
+                        // Fallback: try serialized first, then inventory (wastes 5 units on miss)
+                        try {
+                            slRec = record.load({ type: record.Type.SERIALIZED_INVENTORY_ITEM, id: parseInt(slId, 10), isDynamic: false });
+                        } catch (serErr) {
+                            slRec = record.load({ type: record.Type.INVENTORY_ITEM, id: parseInt(slId, 10), isDynamic: false });
+                        }
                     }
 
                     var slItem = { internalid: slId, locations: [], vendors: [] };

@@ -2,113 +2,131 @@ import { getDb } from "../config/mongdodb.config";
 import { postToNetsuite } from "./netsuite.client";
 import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 
+const PARALLEL_WORKERS = 5;
+const BATCH_LIMIT = 200;
+
 export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
-    console.log(`[NS Sync] Starting sales order sync — mode: ${SYNC_MODE}, stopOnError: ${STOP_ON_ERROR}`);
+    console.log(`[NS SO Sync] Starting — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
 
     const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_sales_order");
 
-    // In "update" mode, re-process all orders (including previously synced ones).
-    // In "skip" mode, only pick up unsynced orders.
-    // Always exclude permanently failed orders (retry count exceeded).
     const filter = SYNC_MODE === "update"
         ? { ns_failed: { $ne: true } }
         : { ns_synced: { $ne: true }, ns_failed: { $ne: true } };
 
-    const BATCH_LIMIT = 200;
     const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
 
     if (orders.length === 0) {
-        console.log("[NS Sync] No orders to process. Skipping.");
+        console.log("[NS SO Sync] No orders to process. Skipping.");
         return [];
     }
 
+    console.log(`[NS SO Sync] Found ${orders.length} orders to process${TEST_MODE ? " (TEST MODE)" : ""}`);
+
+    // In TEST_MODE or STOP_ON_ERROR, fall back to serial processing
+    if (TEST_MODE || STOP_ON_ERROR) {
+        return syncSerial(collection, orders);
+    }
+
+    // ── Parallel sync with worker pool ────────────────────────────────────
     let sent = 0;
     let errors = 0;
     let skipped = 0;
     const results: any[] = [];
+    let index = 0;
 
-    console.log(`[NS SO Sync] Found ${orders.length} orders to process${TEST_MODE ? " (TEST MODE)" : ""}`);
+    async function worker() {
+        while (index < orders.length) {
+            const i = index++;
+            const order = orders[i];
+            const entry = await syncOneOrder(collection, order);
+            results[i] = entry;
 
-    for (const order of orders) {
-        console.log(`[NS SO Sync] Sending order: ${order.otherrefnum}`);
-        try {
-            const result = await postToNetsuite({
-                action:              SYNC_MODE,
-                otherrefnum:         order.otherrefnum,
-                trandate:            order.trandate,
-                store_type:          order.store_type || "amazon",
-                order_status:        order.order_status,
-                fulfillment_channel: order.fulfillment_channel,
-                ship_date:           order.ship_date,
-                items:               order.items,
-                po:                  order.po
-            });
-
-            const entry = { otherrefnum: order.otherrefnum, ...result };
-            results.push(entry);
-
-            // no_items = SKUs not found in NetSuite — mark as synced so we don't retry
-            if (result.action === "no_items") {
-                await collection.updateOne(
-                    { _id: order._id },
-                    { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
-                );
-                console.log(`[NS SO Sync] No matching items — marked & skipped: ${order.otherrefnum}`);
-                skipped++;
-                continue;
-            }
-
-            // If NetSuite returned success: false
-            if (result.success === false) {
-                console.error(`[NS SO Sync] Failed in NetSuite: ${order.otherrefnum} → ${result.error}`);
-                await markFailed(collection, order, result.error);
-                errors++;
-
-                if (STOP_ON_ERROR) {
-                    console.error(`[NS SO Sync] STOP_ON_ERROR is true — halting batch.`);
-                    break;
-                }
-                continue;
-            }
-
-            // Mark as synced so it won't be picked up again
-            await collection.updateOne(
-                { _id: order._id },
-                {
-                    $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: result.action },
-                    $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
-                }
-            );
-            console.log(`[NS SO Sync] Synced & marked: ${order.otherrefnum} → ${result.action}`);
-
-            if (result.action === "skipped") {
-                skipped++;
-                continue;
-            }
-
-            sent++;
-            if (TEST_MODE) {
-                console.log(`[NS SO Sync] TEST_MODE — stopping after first insert/update`);
-                break;
-            }
-        } catch (e: any) {
-            const errMsg = e?.response?.data || e.message;
-            console.error(`[NS Sync] Failed for order ${order.otherrefnum}:`, errMsg);
-            results.push({ otherrefnum: order.otherrefnum, success: false, error: errMsg });
-            await markFailed(collection, order, errMsg);
-            errors++;
-
-            if (STOP_ON_ERROR) {
-                console.error(`[NS SO Sync] STOP_ON_ERROR is true — halting batch.`);
-                break;
-            }
+            if (entry.action === "no_items" || entry.action === "skipped") skipped++;
+            else if (entry.success === false) errors++;
+            else sent++;
         }
     }
 
-    console.log(`[NS Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    await Promise.all(
+        Array.from({ length: Math.min(PARALLEL_WORKERS, orders.length) }, () => worker())
+    );
+
+    console.log(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
     return results;
 };
+
+// ── Process a single order: RESTlet call + MongoDB status update ──────────
+async function syncOneOrder(collection: any, order: any): Promise<any> {
+    try {
+        const result = await postToNetsuite({
+            action:              SYNC_MODE,
+            otherrefnum:         order.otherrefnum,
+            trandate:            order.trandate,
+            store_type:          order.store_type || "amazon",
+            order_status:        order.order_status,
+            fulfillment_channel: order.fulfillment_channel,
+            ship_date:           order.ship_date,
+            items:               order.items,
+            po:                  order.po
+        });
+
+        if (result.action === "no_items") {
+            await collection.updateOne(
+                { _id: order._id },
+                { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
+            );
+            console.log(`[NS SO Sync] No items — skipped: ${order.otherrefnum}`);
+            return { otherrefnum: order.otherrefnum, success: true, action: "no_items" };
+        }
+
+        if (result.success === false) {
+            console.error(`[NS SO Sync] Failed: ${order.otherrefnum} → ${result.error}`);
+            await markFailed(collection, order, result.error);
+            return { otherrefnum: order.otherrefnum, success: false, error: result.error };
+        }
+
+        await collection.updateOne(
+            { _id: order._id },
+            {
+                $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: result.action },
+                $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
+            }
+        );
+        console.log(`[NS SO Sync] Synced: ${order.otherrefnum} → ${result.action}`);
+        return { otherrefnum: order.otherrefnum, ...result };
+
+    } catch (e: any) {
+        const errMsg = e?.response?.data || e.message;
+        console.error(`[NS SO Sync] Error: ${order.otherrefnum}:`, errMsg);
+        await markFailed(collection, order, errMsg);
+        return { otherrefnum: order.otherrefnum, success: false, error: errMsg };
+    }
+}
+
+// ── Serial fallback for TEST_MODE / STOP_ON_ERROR ─────────────────────────
+async function syncSerial(collection: any, orders: any[]): Promise<any[]> {
+    let sent = 0, errors = 0, skipped = 0;
+    const results: any[] = [];
+
+    for (const order of orders) {
+        const entry = await syncOneOrder(collection, order);
+        results.push(entry);
+
+        if (entry.action === "no_items" || entry.action === "skipped") { skipped++; continue; }
+        if (entry.success === false) {
+            errors++;
+            if (STOP_ON_ERROR) { console.error("[NS SO Sync] STOP_ON_ERROR — halting."); break; }
+            continue;
+        }
+        sent++;
+        if (TEST_MODE) { console.log("[NS SO Sync] TEST_MODE — stopping after first."); break; }
+    }
+
+    console.log(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    return results;
+}
 
 // ─── Mark order as failed with retry tracking ────────────────────────────────
 async function markFailed(collection: any, order: any, error: any) {

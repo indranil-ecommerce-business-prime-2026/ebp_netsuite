@@ -310,28 +310,28 @@ app.post("/test-po-flow", async (req: any, res: any) => {
 
         // Step 1: Create 1 test SO via diagnostic RESTlet (no location on items)
         // Pass a predictable otherrefnum so the PO can match it via website_order_number
-        const testId = "TEST-SO-" + 987654321; // ← use a fixed test ID for easy tracking
-        console.log("[TEST-PO-FLOW] Step 1 — Creating test SO via diagnostic (otherrefnum: " + testId + ")...");
-        const soResult = await callDiagnostic({
-            sections: ["create_test_so"],
-            count: 1,
-            otherrefnum: testId,
-        });
+        const testId = "TEST-SO-" + 918273645; // ← use a fixed test ID for easy tracking
+        // console.log("[TEST-PO-FLOW] Step 1 — Creating test SO via diagnostic (otherrefnum: " + testId + ")...");
+        // const soResult = await callDiagnostic({
+        //     sections: ["create_test_so"],
+        //     count: 1,
+        //     otherrefnum: testId,
+        // });
 
-        const createdSO = soResult?.create_test_so?.orders?.[0];
-        if (!createdSO?.success) {
-            return res.status(500).json({
-                success: false,
-                step: "create_test_so",
-                error: createdSO?.error || "Failed to create test SO",
-                soResult,
-            });
-        }
+        // const createdSO = soResult?.create_test_so?.orders?.[0];
+        // if (!createdSO?.success) {
+        //     return res.status(500).json({
+        //         success: false,
+        //         step: "create_test_so",
+        //         error: createdSO?.error || "Failed to create test SO",
+        //         soResult,
+        //     });
+        // }
 
-        console.log(`[TEST-PO-FLOW] SO created: ${createdSO.soNumber} (ID ${createdSO.internalId}, otherrefnum: ${createdSO.otherrefnum})`);
+        // console.log(`[TEST-PO-FLOW] SO created: ${createdSO.soNumber} (ID ${createdSO.internalId}, otherrefnum: ${createdSO.otherrefnum})`);
 
         // Step 2: Send PO to PO RESTlet with website_order_number = SO's otherrefnum
-        const testPoNum = Date.now();
+        const testPoNum = 987612345; // fixed PO number for easy tracking
         const poPayload: any = {
             action:   "update",
             po_type:  poType === "stocking" ? "Stocking" : "Dropship",
@@ -361,7 +361,7 @@ app.post("/test-po-flow", async (req: any, res: any) => {
             Object.assign(poPayload, {
                 po_number:                testPoNum,
                 otherrefnum:              String(testPoNum),
-                vendor_id:                131,
+                vendor_id:                116,
                 distributor:              "suppliesnetwork",
                 distributor_order_number: "322209601",
                 status:                   "Open PO",
@@ -378,16 +378,16 @@ app.post("/test-po-flow", async (req: any, res: any) => {
         console.log(`[TEST-PO-FLOW] Step 2 — Sending ${poPayload.po_type} PO ${poPayload.po_number} (website_order_number: ${poPayload.website_order_number})...`);
         const poResult = await postToNetsuiteForPO(poPayload);
 
-        console.log(`[TEST-PO-FLOW] Done. PO action: ${poResult?.action}, SO update: ${JSON.stringify(poResult?.soUpdate)}`);
+        console.log(`[TEST-PO-FLOW] Done. PO action: ${poResult?.action}, soSetup: ${JSON.stringify(poResult?.soSetup)}, autoPO: ${JSON.stringify(poResult?.autoPO)}`);
 
         res.json({
             success: true,
             type: poType,
-            so: {
-                soNumber:     createdSO.soNumber,
-                internalId:   createdSO.internalId,
-                otherrefnum:  createdSO.otherrefnum,
-            },
+            // so: {
+            //     soNumber:     createdSO.soNumber,
+            //     internalId:   createdSO.internalId,
+            //     otherrefnum:  createdSO.otherrefnum,
+            // },
             po: poResult,
         });
     } catch (e: any) {
@@ -414,13 +414,13 @@ app.listen(PORT, () => {
 });
 
 // ─── CRON: Every 30 mins — Sales Orders ──────────────────────────────────────
-// cron.schedule("*/30 * * * *", async () => {
-//     console.log("[CRON] [SO] Step 1 — Staging sales orders...");
-//     await stageSalesOrders();
+cron.schedule("*/30 * * * *", async () => {
+    console.log("[CRON] [SO] Step 1 — Staging sales orders...");
+    await stageSalesOrders();
 
-//     console.log("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-//     await syncSalesOrdersToNetsuite();
-// });
+    console.log("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+    await syncSalesOrdersToNetsuite();
+});
 
 // // ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
 // cron.schedule("*/30 * * * *", async () => {

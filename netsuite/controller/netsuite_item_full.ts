@@ -45,29 +45,70 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
     const section = mode === "fast" ? "fetch_items_fast" : "fetch_all_items_full";
     const label = mode === "fast" ? "ITEM-FAST" : "ITEM-FULL";
 
-    let page = 0;
+    const PAGE_MAX_RETRIES = 3;
+
+    // ── Resume + Incremental: check last sync metadata ──
+    const metaCol = nsDb.collection("sync_metadata");
+    const lastRun = await metaCol.findOne({ _id: "item_full_sync" } as any);
+
+    // Resume from interrupted page if sync didn't complete
+    let page = lastRun?.lastCompletedPage != null ? lastRun.lastCompletedPage + 1 : 0;
+
+    // Incremental: only fetch items modified since last completed sync
+    // First run (no completedAt) = full sync. Subsequent runs = incremental.
+    let modifiedSince: string | undefined;
+    if (page === 0 && lastRun?.completedAt && mode === "fast") {
+        // Format: "YYYY-MM-DD HH:MM:SS" for SuiteQL
+        const d = new Date(lastRun.completedAt);
+        modifiedSince = d.toISOString().replace("T", " ").substring(0, 19);
+        console.log(`[${label}] Incremental sync — only items modified since ${modifiedSince}`);
+    }
+
+    if (page > 0) {
+        console.log(`[${label}] Resuming from page ${page} (last run stopped at page ${page - 1})`);
+    }
+
     let totalInserted = 0;
     let totalUpdated = 0;
     let totalPulled = 0;
+    let failedPages: number[] = [];
     let done = false;
 
     while (!done) {
         console.log(`[${label}] Fetching page ${page} (pageSize: ${pageSize})...`);
 
         let response: any;
-        try {
-            response = await callDiagnostic({
-                sections: [section],
-                page,
-                pageSize,
-            });
-        } catch (err: any) {
-            // If fast mode fails on page 0, fall back to search mode
-            if (mode === "fast" && page === 0) {
-                console.warn(`[${label}] SuiteQL failed, falling back to N/search mode: ${err.message}`);
-                return runItemFullSync(Math.min(pageSize, 1000), "search");
+        let pageSuccess = false;
+
+        for (let attempt = 1; attempt <= PAGE_MAX_RETRIES; attempt++) {
+            try {
+                response = await callDiagnostic({
+                    sections: [section],
+                    page,
+                    pageSize,
+                    ...(modifiedSince ? { modifiedSince } : {}),
+                });
+                pageSuccess = true;
+                break;
+            } catch (err: any) {
+                // If fast mode fails on page 0, fall back to search mode
+                if (mode === "fast" && page === 0) {
+                    console.warn(`[${label}] SuiteQL failed, falling back to N/search mode: ${err.message}`);
+                    return runItemFullSync(Math.min(pageSize, 1000), "search");
+                }
+                console.error(`[${label}] Page ${page} attempt ${attempt}/${PAGE_MAX_RETRIES} failed: ${err.message}`);
+                if (attempt < PAGE_MAX_RETRIES) {
+                    await new Promise(r => setTimeout(r, 2000 * attempt)); // 2s, 4s backoff
+                }
             }
-            throw err;
+        }
+
+        if (!pageSuccess) {
+            console.error(`[${label}] Page ${page} failed after ${PAGE_MAX_RETRIES} retries — skipping`);
+            failedPages.push(page);
+            page++;
+            // Can't determine done without a response — keep going until we get one
+            continue;
         }
 
         const batch = response?.[section];
@@ -78,7 +119,10 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
                 console.warn(`[${label}] SuiteQL returned error, falling back to N/search: ${batch?.error}`);
                 return runItemFullSync(Math.min(pageSize, 1000), "search");
             }
-            throw new Error(batch?.error || "RESTlet returned failure at page " + page);
+            console.error(`[${label}] Page ${page} returned error: ${batch?.error} — skipping`);
+            failedPages.push(page);
+            page++;
+            continue;
         }
 
         const items: any[] = batch.items || [];
@@ -124,19 +168,36 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
 
         console.log(`[${label}] Page ${page}: ${items.length} items (total: ${totalPulled}/${batch.total})`);
 
+        // Save progress after each successful page
+        await metaCol.updateOne(
+            { _id: "item_full_sync" } as any,
+            { $set: { lastCompletedPage: page, lastPageAt: new Date(), total: batch.total, pageSize } },
+            { upsert: true }
+        );
+
         done = batch.done || items.length === 0;
         page++;
     }
 
-    console.log(`[${label}] Done. Pulled: ${totalPulled}, inserted: ${totalInserted}, updated: ${totalUpdated}`);
+    // Reset resume pointer on completion so next run starts fresh
+    await metaCol.updateOne(
+        { _id: "item_full_sync" } as any,
+        { $set: { lastCompletedPage: null, completedAt: new Date(), totalPulled, failedPages } },
+        { upsert: true }
+    );
+
+    console.log(`[${label}] Done. Pulled: ${totalPulled}, inserted: ${totalInserted}, updated: ${totalUpdated}, failed pages: ${failedPages.length > 0 ? failedPages.join(",") : "none"}`);
 
     return {
         success: true,
         mode,
+        incremental: !!modifiedSince,
+        modifiedSince: modifiedSince || null,
         totalPulled,
         inserted: totalInserted,
         updated: totalUpdated,
         pages: page,
+        failedPages: failedPages.length > 0 ? failedPages : undefined,
     };
 }
 
@@ -144,10 +205,29 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
  * Phase 2: Fetch Location + Vendor sublists for all inventory items
  * in netsuite_items_full that don't yet have _sublists_at (or are stale).
  *
- * Called by hourly cron. Uses record.load (10 governance units each),
- * 50 items per RESTlet call.
+ * Called by hourly cron. Uses record.load (5 governance units each when
+ * item type is passed — avoids try/catch fallback waste).
+ *
+ * Batch size 500 = ~2,500 governance units/call (50% of 5,000 limit).
+ * 3 parallel workers = ~3x throughput.
  */
-export async function runItemSublistsSync(batchSize = 50) {
+const SUBLISTS_BATCH_SIZE = 500;
+const PARALLEL_RESTLET_CALLS = 3;
+
+async function runWithConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+    const results: T[] = [];
+    let index = 0;
+    async function worker() {
+        while (index < tasks.length) {
+            const i = index++;
+            results[i] = await tasks[i]();
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, () => worker()));
+    return results;
+}
+
+export async function runItemSublistsSync(batchSize = SUBLISTS_BATCH_SIZE) {
     const nsDb = await getDb("netsuite");
     const col = nsDb.collection("netsuite_items_full");
 
@@ -170,61 +250,83 @@ export async function runItemSublistsSync(batchSize = 50) {
                 { _sublists_at: { $lt: oneHourAgo } },
             ],
         },
-        { projection: { internalid: 1 } }
+        { projection: { internalid: 1, type: 1 } }
     ).toArray();
 
-    const allIds = itemsDocs
-        .map((d: any) => Number(d.internalid))
-        .filter((id: number) => id > 0);
+    // Build ID list + type map for direct record.load (no try/catch waste)
+    const allItems = itemsDocs
+        .map((d: any) => ({ id: Number(d.internalid), type: d.type as string }))
+        .filter((item) => item.id > 0);
 
-    if (allIds.length === 0) {
+    if (allItems.length === 0) {
         console.log("[ITEM-SUBLISTS] No items need sublist update.");
         return { success: true, updated: 0, total: 0 };
     }
 
-    console.log(`[ITEM-SUBLISTS] Fetching sublists for ${allIds.length} inventory items...`);
+    console.log(`[ITEM-SUBLISTS] Fetching sublists for ${allItems.length} inventory items (batch: ${batchSize}, parallel: ${PARALLEL_RESTLET_CALLS})...`);
 
     let sublistsUpdated = 0;
+    let batchErrors = 0;
 
-    for (let i = 0; i < allIds.length; i += batchSize) {
-        const batchIds = allIds.slice(i, i + batchSize);
+    // Build batch tasks
+    const tasks: (() => Promise<void>)[] = [];
+    for (let i = 0; i < allItems.length; i += batchSize) {
+        const batchItems = allItems.slice(i, i + batchSize);
         const batchNum = Math.floor(i / batchSize) + 1;
-        console.log(`[ITEM-SUBLISTS] Batch ${batchNum}: ${batchIds.length} items...`);
 
-        try {
-            const slResponse = await callDiagnostic({
-                sections: ["fetch_item_sublists"],
-                itemIds: batchIds,
-            });
-
-            const slBatch = slResponse?.fetch_item_sublists;
-            if (slBatch && slBatch.items) {
-                for (const slItem of slBatch.items) {
-                    if (slItem.error) continue;
-
-                    await col.updateOne(
-                        { internalid: String(slItem.internalid) },
-                        {
-                            $set: {
-                                _locations: slItem.locations,
-                                _vendors: slItem.vendors,
-                                _sublists_at: new Date(),
-                            },
-                        }
-                    );
-                    sublistsUpdated++;
-                }
-            }
-        } catch (slErr: any) {
-            console.error(`[ITEM-SUBLISTS] Batch ${batchNum} error:`, slErr.message);
+        const batchIds = batchItems.map((item) => item.id);
+        const itemTypes: Record<string, string> = {};
+        for (const item of batchItems) {
+            itemTypes[String(item.id)] = item.type;
         }
+
+        tasks.push(async () => {
+            console.log(`[ITEM-SUBLISTS] Batch ${batchNum}: ${batchIds.length} items...`);
+            try {
+                const slResponse = await callDiagnostic({
+                    sections: ["fetch_item_sublists"],
+                    itemIds: batchIds,
+                    itemTypes,
+                });
+
+                const slBatch = slResponse?.fetch_item_sublists;
+                if (slBatch && slBatch.items) {
+                    const ops = slBatch.items
+                        .filter((slItem: any) => !slItem.error)
+                        .map((slItem: any) => ({
+                            updateOne: {
+                                filter: { internalid: String(slItem.internalid) },
+                                update: {
+                                    $set: {
+                                        _locations: slItem.locations,
+                                        _vendors: slItem.vendors,
+                                        _sublists_at: new Date(),
+                                    },
+                                },
+                            },
+                        }));
+
+                    if (ops.length > 0) {
+                        const bulkResult: any = await col.bulkWrite(ops, { ordered: false });
+                        sublistsUpdated += bulkResult.modifiedCount + bulkResult.upsertedCount;
+                    }
+                }
+            } catch (slErr: any) {
+                console.error(`[ITEM-SUBLISTS] Batch ${batchNum} error:`, slErr.message);
+                batchErrors++;
+            }
+        });
     }
 
-    console.log(`[ITEM-SUBLISTS] Done. Updated: ${sublistsUpdated}/${allIds.length}`);
+    // Run batches with concurrency limit
+    await runWithConcurrency(tasks, PARALLEL_RESTLET_CALLS);
+
+    console.log(`[ITEM-SUBLISTS] Done. Updated: ${sublistsUpdated}/${allItems.length}, batch errors: ${batchErrors}`);
 
     return {
         success: true,
         updated: sublistsUpdated,
-        total: allIds.length,
+        total: allItems.length,
+        batchErrors,
     };
 }
