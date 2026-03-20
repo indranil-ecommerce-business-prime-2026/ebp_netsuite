@@ -44,7 +44,9 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
                 invoice:                  po.invoice,
                 tracking:                 po.tracking,
                 order_items:              po.order_items,
-                website_order_number:     po.website_order_number
+                website_order_number:     po.website_order_number,
+                po_type:                  po.po_type || "",
+                stocking_warehouse:       po.stocking_warehouse || ""
             });
 
             const entry = { po_number: po.po_number, ...result };

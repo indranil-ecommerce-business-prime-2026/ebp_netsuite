@@ -39,44 +39,57 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
 
     const SYNC_STATUSES = ["Unshipped", "PartiallyShipped", "Shipped", "InvoiceUnconfirmed"];
 
-    // 1. Amazon orders
-    console.log("[SO Stage] Step 1 — Fetching amazon_orders_v3...");
-    const ebp_db = await getDb("ebp_marketplace");
-    const amazon_cursor = ebp_db.collection("amazon_orders_v3").find({
-        PurchaseDate: { $gt: DATE_FILTER },
-        OrderStatus: { $in: SYNC_STATUSES }
-    });
+    // ── Fetch all 4 data sources in parallel ──────────────────────────────
+    console.log("[SO Stage] Fetching amazon, tpx, sku-vendor, po data in parallel...");
 
-    // 2. TPX map — get store_type for each order
-    console.log("[SO Stage] Step 2 — Building TPX map...");
-    const tpx_cursor = (await getDb("tpx_orders")).collection("tpx_orders").find(
-        { $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }] },
-        { projection: { txn_id: 1, store_type: 1 } }
-    );
+    const [ebp_db, tpx_db, ns_db, po_db] = await Promise.all([
+        getDb("ebp_marketplace"),
+        getDb("tpx_orders"),
+        getDb("netsuite"),
+        getDb("ebp_pomanager")
+    ]);
+
+    // Kick off all 4 cursor fetches concurrently
+    const [amazonDocs, tpxDocs, suiteDocs, poDocs] = await Promise.all([
+        // 1. Amazon orders
+        ebp_db.collection("amazon_orders_v3").find({
+            PurchaseDate: { $gt: DATE_FILTER },
+            OrderStatus: { $in: SYNC_STATUSES }
+        }).toArray(),
+
+        // 2. TPX orders
+        tpx_db.collection("tpx_orders").find(
+            { $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }] },
+            { projection: { txn_id: 1, store_type: 1 } }
+        ).toArray(),
+
+        // 3. SKU → vendor map
+        ns_db.collection("suite_list").find(
+            {}, { projection: { vendorname: 1, vendor: 1 } }
+        ).toArray(),
+
+        // 4. PO management
+        po_db.collection("po_management").find({
+            created_at: { $gt: DATE_FILTER_SQL }
+        }).toArray()
+    ]);
+
+    // ── Build maps ────────────────────────────────────────────────────────
     const tpxMap = new Map<string, { store_type: string }>();
-    for await (const tpx of tpx_cursor) {
+    for (const tpx of tpxDocs) {
         if (tpx?.txn_id) tpxMap.set(tpx.txn_id, { store_type: tpx.store_type || "" });
     }
     console.log(`[SO Stage] TPX map: ${tpxMap.size} entries`);
 
-    // 3. SKU → vendor map
-    console.log("[SO Stage] Step 3 — Building SKU→vendor map...");
-    const ns_db = await getDb("netsuite");
-    const suite_cursor = ns_db.collection("suite_list").find({}, { projection: { vendorname: 1, vendor: 1 } });
     const skuVendorMap = new Map<string, number>();
-    for await (const item of suite_cursor) {
+    for (const item of suiteDocs) {
         if (item?.vendorname && item?.vendor)
             skuVendorMap.set(String(item.vendorname).trim().toUpperCase(), item.vendor);
     }
     console.log(`[SO Stage] SKU→vendor map: ${skuVendorMap.size} entries`);
 
-    // 4. PO map
-    console.log("[SO Stage] Step 4 — Building PO map...");
-    const po_cursor = (await getDb("ebp_pomanager")).collection("po_management").find({
-        created_at: { $gt: DATE_FILTER_SQL }
-    });
     const po_map = new Map<string, SimplePO[]>();
-    for await (const po of po_cursor) {
+    for (const po of poDocs) {
         const orderId = po.website_order_number;
         if (!orderId) continue;
         let poVendor: number | null = null;
@@ -88,12 +101,12 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         po_map.get(orderId)!.push({ po_number: po.po_number, po_vendor: poVendor, order_items: po.order_items || [] });
     }
 
-    console.log(`[SO Stage] PO map: ${po_map.size} order IDs`);
+    console.log(`[SO Stage] Amazon: ${amazonDocs.length}, PO map: ${po_map.size} order IDs`);
 
     // 5. Build sales orders
-    console.log("[SO Stage] Step 5 — Building sales orders...");
+    console.log("[SO Stage] Building sales orders...");
     const sales_orders: SalesOrder[] = [];
-    for await (const order of amazon_cursor) {
+    for (const order of amazonDocs) {
         const orderId = order?.AmazonOrderId;
         if (!orderId) continue;
 
