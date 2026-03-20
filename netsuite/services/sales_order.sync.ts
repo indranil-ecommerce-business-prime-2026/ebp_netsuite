@@ -1,12 +1,13 @@
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuite } from "./netsuite.client";
 import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import log from "../config/logger.config";
 
 const PARALLEL_WORKERS = 5;
-const BATCH_LIMIT = 500;
+const BATCH_LIMIT = 300;
 
 export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
-    console.log(`[NS SO Sync] Starting — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
+    log.info(`[NS SO Sync] Starting — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
 
     const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_sales_order");
@@ -18,11 +19,11 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
 
     if (orders.length === 0) {
-        console.log("[NS SO Sync] No orders to process. Skipping.");
+        log.info("[NS SO Sync] No orders to process. Skipping.");
         return [];
     }
 
-    console.log(`[NS SO Sync] Found ${orders.length} orders to process${TEST_MODE ? " (TEST MODE)" : ""}`);
+    log.info(`[NS SO Sync] Found ${orders.length} orders to process${TEST_MODE ? " (TEST MODE)" : ""}`);
 
     // In TEST_MODE or STOP_ON_ERROR, fall back to serial processing
     if (TEST_MODE || STOP_ON_ERROR) {
@@ -53,7 +54,7 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
         Array.from({ length: Math.min(PARALLEL_WORKERS, orders.length) }, () => worker())
     );
 
-    console.log(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    log.info(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
     return results;
 };
 
@@ -77,12 +78,12 @@ async function syncOneOrder(collection: any, order: any): Promise<any> {
                 { _id: order._id },
                 { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
             );
-            console.log(`[NS SO Sync] No items — skipped: ${order.otherrefnum}`);
+            log.info(`[NS SO Sync] No items — skipped: ${order.otherrefnum}`);
             return { otherrefnum: order.otherrefnum, success: true, action: "no_items" };
         }
 
         if (result.success === false) {
-            console.error(`[NS SO Sync] Failed: ${order.otherrefnum} → ${result.error}`);
+            log.error(`[NS SO Sync] Failed: ${order.otherrefnum} → ${result.error}`);
             await markFailed(collection, order, result.error);
             return { otherrefnum: order.otherrefnum, success: false, error: result.error };
         }
@@ -94,12 +95,12 @@ async function syncOneOrder(collection: any, order: any): Promise<any> {
                 $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
             }
         );
-        console.log(`[NS SO Sync] Synced: ${order.otherrefnum} → ${result.action}`);
+        log.info(`[NS SO Sync] Synced: ${order.otherrefnum} → ${result.action}`);
         return { otherrefnum: order.otherrefnum, ...result };
 
     } catch (e: any) {
         const errMsg = e?.response?.data || e.message;
-        console.error(`[NS SO Sync] Error: ${order.otherrefnum}:`, errMsg);
+        log.error(`[NS SO Sync] Error: ${order.otherrefnum}:`, errMsg);
         await markFailed(collection, order, errMsg);
         return { otherrefnum: order.otherrefnum, success: false, error: errMsg };
     }
@@ -117,14 +118,14 @@ async function syncSerial(collection: any, orders: any[]): Promise<any[]> {
         if (entry.action === "no_items" || entry.action === "skipped") { skipped++; continue; }
         if (entry.success === false) {
             errors++;
-            if (STOP_ON_ERROR) { console.error("[NS SO Sync] STOP_ON_ERROR — halting."); break; }
+            if (STOP_ON_ERROR) { log.error("[NS SO Sync] STOP_ON_ERROR — halting."); break; }
             continue;
         }
         sent++;
-        if (TEST_MODE) { console.log("[NS SO Sync] TEST_MODE — stopping after first."); break; }
+        if (TEST_MODE) { log.info("[NS SO Sync] TEST_MODE — stopping after first."); break; }
     }
 
-    console.log(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    log.info(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
     return results;
 }
 
@@ -144,7 +145,7 @@ async function markFailed(collection: any, order: any, error: any) {
 
     if (permanentlyFailed) {
         update.$set.ns_failed = true;
-        console.error(`[NS SO Sync] Order ${order.otherrefnum} exceeded ${MAX_RETRIES} retries — marked as permanently failed.`);
+        log.error(`[NS SO Sync] Order ${order.otherrefnum} exceeded ${MAX_RETRIES} retries — marked as permanently failed.`);
     }
 
     await collection.updateOne({ _id: order._id }, update);

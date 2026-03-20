@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { getDb } from "../config/mongdodb.config";
 import { callDiagnostic } from "../services/netsuite.client";
+import log from "../config/logger.config";
 
 const trim = (v: any) => (v == null ? "" : String(v).trim());
 const toNum = (v: any) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
@@ -129,7 +130,7 @@ export const syncNetsuiteItems = async (req: Request, res: Response) => {
         let done = false;
 
         while (!done) {
-            console.log(`[ITEM-SYNC] Fetching page ${page} (pageSize: ${pageSize})...`);
+            log.info(`[ITEM-SYNC] Fetching page ${page} (pageSize: ${pageSize})...`);
 
             const response = await callDiagnostic({
                 sections: ["fetch_all_items"],
@@ -175,13 +176,13 @@ export const syncNetsuiteItems = async (req: Request, res: Response) => {
                 }
             }
 
-            console.log(`[ITEM-SYNC] Page ${page}: ${items.length} items (total: ${totalPulled}/${batch.total})`);
+            log.info(`[ITEM-SYNC] Page ${page}: ${items.length} items (total: ${totalPulled}/${batch.total})`);
 
             done = batch.done || items.length === 0;
             page++;
         }
 
-        console.log(`[ITEM-SYNC] Done. Pulled: ${totalPulled}, inserted: ${totalInserted}, updated: ${totalUpdated}`);
+        log.info(`[ITEM-SYNC] Done. Pulled: ${totalPulled}, inserted: ${totalInserted}, updated: ${totalUpdated}`);
 
         return res.json({
             success: true,
@@ -191,7 +192,7 @@ export const syncNetsuiteItems = async (req: Request, res: Response) => {
             pages: page,
         });
     } catch (err: any) {
-        console.error("[ITEM-SYNC] Error:", err);
+        log.error("[ITEM-SYNC] Error:", err);
         return res.status(500).json({ success: false, error: err?.message ?? String(err) });
     }
 };

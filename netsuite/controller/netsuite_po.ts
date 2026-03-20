@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { getDb } from "../config/mongdodb.config";
 import { callDiagnostic } from "../services/netsuite.client";
+import log from "../config/logger.config";
 
 const trim = (v: any) => (v == null ? "" : String(v).trim());
 const toNum = (v: any) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
@@ -63,7 +64,7 @@ export const syncNetsuitePOs = async (req: Request, res: Response) => {
         let done = false;
 
         while (!done) {
-            console.log(`[PO-FETCH] Fetching page ${page} (pageSize: ${pageSize})...`);
+            log.info(`[PO-FETCH] Fetching page ${page} (pageSize: ${pageSize})...`);
 
             const response = await callDiagnostic({
                 sections: ["fetch_all_po"],
@@ -109,13 +110,13 @@ export const syncNetsuitePOs = async (req: Request, res: Response) => {
                 }
             }
 
-            console.log(`[PO-FETCH] Page ${page}: ${pos.length} POs (total: ${totalPulled}/${batch.total})`);
+            log.info(`[PO-FETCH] Page ${page}: ${pos.length} POs (total: ${totalPulled}/${batch.total})`);
 
             done = batch.done || pos.length === 0;
             page++;
         }
 
-        console.log(`[PO-FETCH] Done. Pulled: ${totalPulled}, inserted: ${totalInserted}, updated: ${totalUpdated}`);
+        log.info(`[PO-FETCH] Done. Pulled: ${totalPulled}, inserted: ${totalInserted}, updated: ${totalUpdated}`);
 
         return res.json({
             success: true,
@@ -125,7 +126,7 @@ export const syncNetsuitePOs = async (req: Request, res: Response) => {
             pages: page,
         });
     } catch (err: any) {
-        console.error("[PO-FETCH] Error:", err);
+        log.error("[PO-FETCH] Error:", err);
         return res.status(500).json({ success: false, error: err?.message ?? String(err) });
     }
 };

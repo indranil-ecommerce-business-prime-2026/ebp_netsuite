@@ -1,4 +1,5 @@
 import { getDb } from "../config/mongdodb.config";
+import log from "../config/logger.config";
 
 interface SalesItem {
     item: string;
@@ -32,7 +33,7 @@ interface SalesOrder {
 }
 
 export const stageSalesOrders = async (): Promise<{ processed: number }> => {
-    console.log("[SO Stage] Starting...");
+    log.info("[SO Stage] Starting...");
 
     const DATE_FILTER     = "2026-01-01T00:00:00Z";
     const DATE_FILTER_SQL = "2026-01-01 00:00:00";
@@ -40,7 +41,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
     const SYNC_STATUSES = ["Unshipped", "PartiallyShipped", "Shipped", "InvoiceUnconfirmed"];
 
     // ── Fetch all 4 data sources in parallel ──────────────────────────────
-    console.log("[SO Stage] Fetching amazon, tpx, sku-vendor, po data in parallel...");
+    log.info("[SO Stage] Fetching amazon, tpx, sku-vendor, po data in parallel...");
 
     const [ebp_db, tpx_db, ns_db, po_db] = await Promise.all([
         getDb("ebp_marketplace"),
@@ -79,14 +80,14 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
     for (const tpx of tpxDocs) {
         if (tpx?.txn_id) tpxMap.set(tpx.txn_id, { store_type: tpx.store_type || "" });
     }
-    console.log(`[SO Stage] TPX map: ${tpxMap.size} entries`);
+    log.info(`[SO Stage] TPX map: ${tpxMap.size} entries`);
 
     const skuVendorMap = new Map<string, number>();
     for (const item of suiteDocs) {
         if (item?.vendorname && item?.vendor)
             skuVendorMap.set(String(item.vendorname).trim().toUpperCase(), item.vendor);
     }
-    console.log(`[SO Stage] SKU→vendor map: ${skuVendorMap.size} entries`);
+    log.info(`[SO Stage] SKU→vendor map: ${skuVendorMap.size} entries`);
 
     const po_map = new Map<string, SimplePO[]>();
     for (const po of poDocs) {
@@ -101,10 +102,10 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         po_map.get(orderId)!.push({ po_number: po.po_number, po_vendor: poVendor, order_items: po.order_items || [] });
     }
 
-    console.log(`[SO Stage] Amazon: ${amazonDocs.length}, PO map: ${po_map.size} order IDs`);
+    log.info(`[SO Stage] Amazon: ${amazonDocs.length}, PO map: ${po_map.size} order IDs`);
 
     // 5. Build sales orders
-    console.log("[SO Stage] Building sales orders...");
+    log.info("[SO Stage] Building sales orders...");
     const sales_orders: SalesOrder[] = [];
     for (const order of amazonDocs) {
         const orderId = order?.AmazonOrderId;
@@ -131,7 +132,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
     }
 
     // 6. Upsert into netsuite.suite_sales_order (staging)
-    console.log(`[SO Stage] Step 6 — Upserting ${sales_orders.length} sales orders...`);
+    log.info(`[SO Stage] Step 6 — Upserting ${sales_orders.length} sales orders...`);
     if (sales_orders.length > 0) {
         await ns_db.collection<SalesOrder>("suite_sales_order").bulkWrite(
             sales_orders.map(order => ({
@@ -144,6 +145,6 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         );
     }
 
-    console.log(`[Stage] Staged ${sales_orders.length} sales orders to netsuite.suite_sales_order`);
+    log.info(`[Stage] Staged ${sales_orders.length} sales orders to netsuite.suite_sales_order`);
     return { processed: sales_orders.length };
 };

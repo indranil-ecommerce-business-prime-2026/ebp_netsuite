@@ -1,4 +1,5 @@
 import { getDb } from "../config/mongdodb.config";
+import log from "../config/logger.config";
 
 // Distributor (DB value) + payment_type → { vendor name, NetSuite vendor ID }
 // Default = non-DLL variant (NET/TERM)
@@ -27,7 +28,7 @@ function resolveVendor(distributor: string, payment_type: string): { name: strin
 
     const entry = VENDOR_MAP[key];
     if (!entry) {
-        console.warn(`[PO Stage] Unknown distributor: "${distributor}" — vendor_id will be null`);
+        log.warn(`[PO Stage] Unknown distributor: "${distributor}" — vendor_id will be null`);
         return { name: distributor || "", id: null };
     }
 
@@ -57,15 +58,15 @@ export interface StagedPO {
 }
 
 export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
-    console.log("[PO Stage] Starting...");
+    log.info("[PO Stage] Starting...");
 
     const po_db = await getDb("ebp_pomanager");
-    console.log("[PO Stage] Connected to ebp_pomanager");
+    log.info("[PO Stage] Connected to ebp_pomanager");
     const ns_db = await getDb("netsuite");
-    console.log("[PO Stage] Connected to netsuite");
+    log.info("[PO Stage] Connected to netsuite");
 
     // ── Filter: only POs after 2026-01-01 with status Shipped or Invoiced ──
-    console.log("[PO Stage] Querying po_management (Shipped/Invoiced, created >= 2026-01-01)...");
+    log.info("[PO Stage] Querying po_management (Shipped/Invoiced, created >= 2026-01-01)...");
     const po_cursor = po_db.collection("po_management").find({
         status: { $in: ["Shipped", "Invoiced"] },
         created_at: { $gte: "2026-01-01" }
@@ -80,7 +81,7 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
         const vendor = resolveVendor(po.distributor, po.payment_type);
 
         if (!po.po_type) {
-            console.warn(`[PO Stage] PO ${po.po_number} has no po_type — will not trigger Dropship flow`);
+            log.warn(`[PO Stage] PO ${po.po_number} has no po_type — will not trigger Dropship flow`);
         }
 
         staged.push({
@@ -100,10 +101,10 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
         });
     }
 
-    console.log(`[PO Stage] Found ${staged.length} POs matching filter`);
+    log.info(`[PO Stage] Found ${staged.length} POs matching filter`);
 
     if (staged.length > 0) {
-        console.log("[PO Stage] Upserting to netsuite.suite_purchase_order...");
+        log.info("[PO Stage] Upserting to netsuite.suite_purchase_order...");
         await ns_db.collection<StagedPO>("suite_purchase_order").bulkWrite(
             staged.map(po => ({
                 updateOne: {
@@ -115,6 +116,6 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
         );
     }
 
-    console.log(`[PO Stage] Staged ${staged.length} purchase orders to netsuite.suite_purchase_order`);
+    log.info(`[PO Stage] Staged ${staged.length} purchase orders to netsuite.suite_purchase_order`);
     return { processed: staged.length };
 };
