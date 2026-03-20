@@ -3,7 +3,7 @@ import { postToNetsuite } from "./netsuite.client";
 import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 
 const PARALLEL_WORKERS = 5;
-const BATCH_LIMIT = 200;
+const BATCH_LIMIT = 500;
 
 export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     console.log(`[NS SO Sync] Starting — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
