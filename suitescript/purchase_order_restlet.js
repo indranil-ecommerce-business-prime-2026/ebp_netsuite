@@ -22,7 +22,6 @@
  *   distributor_order_number: "DNH-98765",
  *   status:                   "shipped",
  *   invoice:                  ["INV-001", ...] | [],    ← array from po_management
- *   tracking:                 "1Z999AA10123456784" | null,
  *   website_order_number:     "113-1234567-1234567",
  *   po_type:                  "Dropship" | "Stocking",
  *   stocking_warehouse:       "MW" | "W2G-PA" | "W2G-IL" | "W2G-KY" | "W2G-TX" | "",
@@ -182,10 +181,15 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         return null;
     }
 
-    // ── Update SO line locations to Dropship ─────────────────────────────
-    // Sets location=Dropship on each SO line item. Needed for correct
-    // fulfillment routing. Idempotent — skips lines already set.
-    function updateSOLocationForDropship(soId, dropshipLocationId) {
+    // ── Update SO for Dropship — location + qty/amount sync ─────────────
+    // Sets location=Dropship AND updates qty/amount on matching lines.
+    // This MUST run BEFORE record.create with defaultValues.soid so the PO
+    // auto-populates with the correct qty. Without this, po.save() tries to
+    // back-sync a qty change to the SO and fails with DROP_SHIP_ERROR
+    // ("Please enter a value for Amount").
+    //
+    // resolvedItems: [{ itemId, qty, cost, sku }] from SKU resolution
+    function updateSOForDropship(soId, dropshipLocationId, resolvedItems) {
         if (!soId) return { success: false, reason: "no soId provided" };
 
         var so = record.load({ type: record.Type.SALES_ORDER, id: soId, isDynamic: true });
@@ -195,9 +199,19 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         var soStatus = so.getValue({ fieldId: "status" });
         log.debug("SO_STATUS", "SO " + soId + " status=" + soStatus);
 
+        // Build itemId → desired qty map from resolvedItems
+        var qtyMap = {};
+        if (resolvedItems && resolvedItems.length > 0) {
+            for (var qi = 0; qi < resolvedItems.length; qi++) {
+                qtyMap[String(resolvedItems[qi].itemId)] = resolvedItems[qi].qty;
+            }
+        }
+
         for (var i = 0; i < lineCount; i++) {
             so.selectLine({ sublistId: "item", line: i });
+            var changed = false;
 
+            // Location → Dropship
             if (dropshipLocationId) {
                 var currentLoc = so.getCurrentSublistValue({ sublistId: "item", fieldId: "location" });
                 if (String(currentLoc) !== String(dropshipLocationId)) {
@@ -205,20 +219,36 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         sublistId: "item", fieldId: "location",
                         value: dropshipLocationId, ignoreFieldChange: false
                     });
-                    linesChanged++;
+                    changed = true;
                 }
             }
 
+            // Qty → match PO order_items (so PO auto-populate gets correct qty)
+            var lineItemId = String(so.getCurrentSublistValue({ sublistId: "item", fieldId: "item" }));
+            if (qtyMap[lineItemId] !== undefined) {
+                var currentQty = so.getCurrentSublistValue({ sublistId: "item", fieldId: "quantity" });
+                var desiredQty = qtyMap[lineItemId];
+                if (Number(currentQty) !== Number(desiredQty)) {
+                    var currentRate = Number(so.getCurrentSublistValue({ sublistId: "item", fieldId: "rate" })) || 0;
+                    so.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: desiredQty, ignoreFieldChange: false });
+                    // Explicitly set amount = qty * SO rate (keep SO retail price, just update for new qty)
+                    so.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: desiredQty * currentRate, ignoreFieldChange: false });
+                    log.debug("SO_QTY_UPDATE", "Line " + i + " item " + lineItemId + ": qty " + currentQty + " → " + desiredQty + ", amount → " + (desiredQty * currentRate));
+                    changed = true;
+                }
+            }
+
+            if (changed) linesChanged++;
             so.commitLine({ sublistId: "item" });
         }
 
         if (linesChanged === 0) {
-            log.debug("SO_LOC_SKIP", "All " + lineCount + " lines already set to Dropship — skipping save");
+            log.debug("SO_SETUP_SKIP", "All " + lineCount + " lines already correct — skipping save");
             return { success: true, soId: soId, linesChanged: 0, soStatus: soStatus };
         }
 
         var savedSoId = so.save({ enableSourcing: true, ignoreMandatoryFields: true });
-        log.debug("SO_LOC_SAVED", "SO " + savedSoId + " — " + linesChanged + "/" + lineCount + " lines updated to Dropship");
+        log.debug("SO_SETUP_SAVED", "SO " + savedSoId + " — " + linesChanged + "/" + lineCount + " lines updated");
 
         return { success: true, soId: savedSoId, linesChanged: linesChanged, soStatus: soStatus };
     }
@@ -250,6 +280,28 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         };
     }
 
+    // ── Set PO header fields ────────────────────────────────────────────
+    function setPOHeaders(po, opts) {
+        po.setValue({ fieldId: "otherrefnum", value: String(opts.po_number) });
+        po.setValue({ fieldId: "trandate",    value: new Date() });
+        po.setValue({ fieldId: "memo",        value: opts.website_order_number });
+
+        try { po.setValue({ fieldId: "custbody2", value: String(opts.distributor_order_number || opts.po_number) }); } catch (e) {
+            log.debug("FIELD_SKIP", "custbody2: " + e.message);
+        }
+        try { po.setValue({ fieldId: "custbody1", value: opts.status }); } catch (e) {
+            log.debug("FIELD_SKIP", "custbody1: " + e.message);
+        }
+        if (opts.distributor) {
+            try { po.setValue({ fieldId: "custbody_otherrefnumber_custom", value: String(opts.distributor) }); } catch (e) {
+                log.debug("FIELD_SKIP", "custbody_otherrefnumber_custom: " + e.message);
+            }
+        }
+        if (Array.isArray(opts.invoice) && opts.invoice.length > 0) {
+            po.setValue({ fieldId: "memo", value: opts.website_order_number + " | INV: " + opts.invoice[0] });
+        }
+    }
+
     // ── Main POST handler ───────────────────────────────────────────────
     function post(payload) {
         var before = null;
@@ -267,7 +319,6 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var distributor_order_number = payload.distributor_order_number || "";
             var status                   = payload.status || "";
             var invoice                  = payload.invoice;
-            var tracking                 = payload.tracking;
             var website_order_number     = payload.website_order_number || "";
             var order_items              = payload.order_items;
             var po_type                  = payload.po_type || "";
@@ -313,111 +364,8 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 }
             }
 
-            // ── Build record ─────────────────────────────────────────────────
-            var po;
-            var isUpdate = false;
-            var isDropshipCreate = false;
-            var soSetupResult = null;
-            var autoPOInfo = null;
-
-            if (po_type === "Dropship" && linkedSoId) {
-                // ── DROPSHIP: Update SO location → Create linked PO ──────────
-                // Step 1: Update SO line locations to "Dropship"
-                var dropshipLocId = findLocationByName("Dropship");
-                soSetupResult = updateSOLocationForDropship(linkedSoId, dropshipLocId);
-                log.debug("SO_LOC_RESULT", JSON.stringify(soSetupResult));
-
-                // Step 2: Check if a PO already exists for this SO
-                autoPOInfo = findLinkedPO(linkedSoId);
-
-                if (autoPOInfo) {
-                    // PO already linked — load for update
-                    log.debug("LINKED_PO_FOUND", "PO " + autoPOInfo.poNumber + " (ID " + autoPOInfo.id + ") already linked to SO " + linkedSoNumber);
-                    po = record.load({ type: record.Type.PURCHASE_ORDER, id: autoPOInfo.id, isDynamic: true });
-                    isUpdate = true;
-                } else {
-                    // Step 3: Create PO linked to SO via defaultValues.soid
-                    // (SuiteAnswers 71358 — the only way to set createdfrom on a PO)
-                    log.debug("DROPSHIP_CREATE", "Creating linked dropship PO for SO " + linkedSoNumber + " (customer " + linkedSoCustomerId + ", vendor " + vendor_id + ")");
-                    po = record.create({
-                        type: record.Type.PURCHASE_ORDER,
-                        isDynamic: true,
-                        defaultValues: {
-                            soid: linkedSoId,
-                            dropship: "T",
-                            custid: linkedSoCustomerId,
-                            entity: parseInt(vendor_id, 10),
-                            poentity: parseInt(vendor_id, 10)
-                        }
-                    });
-                    isDropshipCreate = true;
-                }
-
-            } else if (existing && action === "update") {
-                po = record.load({ type: record.Type.PURCHASE_ORDER, id: existing.id, isDynamic: true });
-                isUpdate = true;
-
-            } else {
-                po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
-            }
-
-            // ── Form — set FIRST before anything else ────────────────────────
-            var formId = findFormId("Ecomm BP - Purchase Order");
-            if (formId) {
-                po.setValue({ fieldId: "customform", value: parseInt(formId, 10) });
-                log.debug("FORM_SET", "customform → " + formId);
-            }
-
-            // ── Vendor (required for Purchase Order) — set after form ────────
-            if (vendor_id) {
-                po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
-            }
-
-            var poSubsidiary = "";
-            try { poSubsidiary = po.getValue({ fieldId: "subsidiary" }); } catch (e) {}
-            log.debug("ENTITY_SET", JSON.stringify({
-                vendor: vendor_id,
-                subsidiary: poSubsidiary,
-                form: po.getValue({ fieldId: "customform" })
-            }));
-
-            // ── Standard fields ──────────────────────────────────────────────
-            po.setValue({ fieldId: "otherrefnum", value: String(po_number) });
-            po.setValue({ fieldId: "trandate",    value: new Date() });
-            po.setValue({ fieldId: "memo",        value: website_order_number });
-
-            // ── Custom fields — wrapped in try/catch ─────────────────────────
-            try { po.setValue({ fieldId: "custbody2", value: String(distributor_order_number || po_number) }); } catch (e) {
-                log.debug("FIELD_SKIP", "custbody2: " + e.message);
-            }
-            try { po.setValue({ fieldId: "custbody1", value: status }); } catch (e) {
-                log.debug("FIELD_SKIP", "custbody1: " + e.message);
-            }
-
-            // custbody_otherrefnumber_custom — only set if it exists on PO form
-            if (distributor) {
-                try { po.setValue({ fieldId: "custbody_otherrefnumber_custom", value: String(distributor) }); } catch (e) {
-                    log.debug("FIELD_SKIP", "custbody_otherrefnumber_custom: " + e.message);
-                }
-            }
-
-            // ── Invoice reference ────────────────────────────────────────────
-            if (Array.isArray(invoice) && invoice.length > 0) {
-                po.setValue({ fieldId: "memo", value: website_order_number + " | INV: " + invoice[0] });
-            }
-
-            // ── Resolve location for line items ──────────────────────────────
-            var locationId = resolveLocation(po_type, stocking_warehouse);
-            log.debug("LOCATION_RESOLVED", JSON.stringify({
-                po_type: po_type,
-                stocking_warehouse: stocking_warehouse,
-                locationId: locationId
-            }));
-
-            // ── SNAPSHOT: BEFORE (after header set, before line changes) ────
-            before = snapshotPO(po);
-
             // ── Resolve all PO item SKUs → internal IDs upfront ──────────────
+            // Done FIRST so dropship path can use resolvedItems to update SO qty
             var skippedSkus = [];
             var resolvedItems = [];   // { sku, itemId, qty, cost }
 
@@ -465,6 +413,132 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 }
             }
 
+            // ── Resolve location for line items ──────────────────────────────
+            var locationId = resolveLocation(po_type, stocking_warehouse);
+            log.debug("LOCATION_RESOLVED", JSON.stringify({
+                po_type: po_type,
+                stocking_warehouse: stocking_warehouse,
+                locationId: locationId
+            }));
+
+            // ── Build record ─────────────────────────────────────────────────
+            var po;
+            var isUpdate = false;
+            var isDropshipCreate = false;
+            var soSetupResult = null;
+            var autoPOInfo = null;
+
+            var headerOpts = {
+                po_number: po_number,
+                website_order_number: website_order_number,
+                distributor_order_number: distributor_order_number,
+                status: status,
+                distributor: distributor,
+                invoice: invoice
+            };
+
+            if (po_type === "Dropship" && linkedSoId) {
+                // ── DROPSHIP FLOW ────────────────────────────────────────────
+                autoPOInfo = findLinkedPO(linkedSoId);
+
+                if (autoPOInfo) {
+                    // PO already linked — load for update
+                    log.debug("LINKED_PO_FOUND", "PO " + autoPOInfo.poNumber + " (ID " + autoPOInfo.id + ") already linked to SO " + linkedSoNumber);
+                    po = record.load({ type: record.Type.PURCHASE_ORDER, id: autoPOInfo.id, isDynamic: true });
+                    isUpdate = true;
+
+                    // Set headers + snapshot
+                    setPOHeaders(po, headerOpts);
+
+                } else {
+                    // Step 1: Update SO — location=Dropship + qty to match order_items
+                    // This prevents DROP_SHIP_ERROR on po.save() back-sync
+                    var dropshipLocId = findLocationByName("Dropship");
+                    soSetupResult = updateSOForDropship(linkedSoId, dropshipLocId, resolvedItems);
+                    log.debug("SO_SETUP_RESULT", JSON.stringify(soSetupResult));
+
+                    // Step 2: Fetch subsidiary for defaultValues
+                    var soSubsidiary = null;
+                    try {
+                        var soRec = search.lookupFields({
+                            type: search.Type.SALES_ORDER,
+                            id: linkedSoId,
+                            columns: ["subsidiary"]
+                        });
+                        if (soRec.subsidiary && soRec.subsidiary[0]) {
+                            soSubsidiary = parseInt(soRec.subsidiary[0].value, 10);
+                        }
+                    } catch (subErr) {
+                        log.debug("SO_SUBSIDIARY_ERR", subErr.message);
+                    }
+
+                    // Step 3: Create PO — lines auto-populate from updated SO
+                    var poDefaults = {
+                        soid: linkedSoId,
+                        shipgroup: "1",
+                        dropship: "T",
+                        custid: linkedSoCustomerId,
+                        entity: parseInt(vendor_id, 10),
+                        poentity: parseInt(vendor_id, 10)
+                    };
+                    if (soSubsidiary) {
+                        poDefaults.subsidiary = soSubsidiary;
+                    }
+
+                    log.debug("DROPSHIP_DEFAULTS", JSON.stringify(poDefaults));
+
+                    po = record.create({
+                        type: record.Type.PURCHASE_ORDER,
+                        isDynamic: true,
+                        defaultValues: poDefaults
+                    });
+                    isDropshipCreate = true;
+
+                    // Set headers (skip form + entity — already set via defaultValues)
+                    setPOHeaders(po, headerOpts);
+                }
+
+            } else if (existing && action === "update") {
+                po = record.load({ type: record.Type.PURCHASE_ORDER, id: existing.id, isDynamic: true });
+                isUpdate = true;
+
+                // Form + entity + headers
+                var formId = findFormId("Ecomm BP - Purchase Order");
+                if (formId) {
+                    po.setValue({ fieldId: "customform", value: parseInt(formId, 10) });
+                    log.debug("FORM_SET", "customform → " + formId);
+                }
+                if (vendor_id) {
+                    po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                }
+                setPOHeaders(po, headerOpts);
+
+            } else {
+                // New standard PO
+                po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+
+                var formId2 = findFormId("Ecomm BP - Purchase Order");
+                if (formId2) {
+                    po.setValue({ fieldId: "customform", value: parseInt(formId2, 10) });
+                    log.debug("FORM_SET", "customform → " + formId2);
+                }
+                if (vendor_id) {
+                    po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                }
+                setPOHeaders(po, headerOpts);
+            }
+
+            var poSubsidiary = "";
+            try { poSubsidiary = po.getValue({ fieldId: "subsidiary" }); } catch (e) {}
+            log.debug("ENTITY_SET", JSON.stringify({
+                vendor: vendor_id,
+                subsidiary: poSubsidiary,
+                form: po.getValue({ fieldId: "customform" })
+            }));
+
+            // ── SNAPSHOT: BEFORE (after header set, before line changes) ────
+            before = snapshotPO(po);
+
             // ── Line items ─────────────────────────────────────────────────────
             var oldLineCount = po.getLineCount({ sublistId: "item" });
             var linesAdded = 0;
@@ -472,9 +546,8 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
             if (isDropshipCreate && oldLineCount > 0) {
                 // ── DROPSHIP: Lines auto-populated from SO via defaultValues.soid ──
-                // Update existing lines in-place (qty, rate, location) to preserve
-                // the native SO↔PO line-level link.
-                log.debug("DROPSHIP_LINES", "Auto-populated " + oldLineCount + " lines from SO — updating in-place");
+                // Qty already matches (SO was updated first). Only update rate + location.
+                log.debug("DROPSHIP_LINES", "Auto-populated " + oldLineCount + " lines from SO — updating rate/location only");
 
                 // Build map: itemId → [line indices] for matching
                 var existingLineMap = {};
@@ -508,14 +581,14 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                     if (matchedLine >= 0) {
                         try {
                             po.selectLine({ sublistId: "item", line: matchedLine });
-                            po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: poItem.qty, ignoreFieldChange: false });
+                            // Only update rate (cost) — qty already matches from SO update
                             po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: poItem.cost, ignoreFieldChange: false });
                             if (locationId) {
                                 po.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId, ignoreFieldChange: false });
                             }
                             po.commitLine({ sublistId: "item" });
                             linesUpdated++;
-                            log.debug("LINE_UPDATED", "Line " + matchedLine + " — SKU \"" + poItem.sku + "\" qty=" + poItem.qty + " rate=" + poItem.cost);
+                            log.debug("LINE_UPDATED", "Line " + matchedLine + " — SKU \"" + poItem.sku + "\" rate=" + poItem.cost);
                         } catch (updErr) {
                             log.error("LINE_UPDATE_ERR", "Line " + matchedLine + " SKU \"" + poItem.sku + "\" — " + updErr.message);
                             unmatchedItems.push(poItem);
@@ -536,6 +609,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         }
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: newItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: newItem.cost, ignoreFieldChange: false });
+                        po.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: newItem.qty * newItem.cost, ignoreFieldChange: false });
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                     } catch (addErr) {
@@ -580,14 +654,10 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 }
 
                 // Remove old lines in reverse order
-                if (oldLineCount > 0 && linesAdded > 0) {
+                if (oldLineCount > 0) {
                     log.debug("REMOVE_OLD", "Removing " + oldLineCount + " old lines (new added: " + linesAdded + ")");
                     for (var r = oldLineCount - 1; r >= 0; r--) {
                         po.removeLine({ sublistId: "item", line: r });
-                    }
-                } else if (oldLineCount > 0 && linesAdded === 0) {
-                    for (var r2 = oldLineCount - 1; r2 >= 0; r2--) {
-                        po.removeLine({ sublistId: "item", line: r2 });
                     }
                 }
             }

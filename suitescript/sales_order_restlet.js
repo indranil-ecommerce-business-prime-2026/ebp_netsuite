@@ -257,7 +257,42 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         // Item FIRST — triggers sourcing (tax engine, defaults)
                         so.setCurrentSublistValue({ sublistId: "item", fieldId: "item", value: itemInternalId });
 
-                        // Location — intentionally not set (let NetSuite default)
+                        // ── Clear location (no warehouse at SO level) ──
+                        try {
+                            var autoLoc = so.getCurrentSublistValue({ sublistId: "item", fieldId: "location" });
+                            if (autoLoc) {
+                                so.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: "", ignoreFieldChange: false });
+                                var afterLoc = so.getCurrentSublistValue({ sublistId: "item", fieldId: "location" });
+                                log.debug("LOC_CLEARED", "Line " + i + ": " + autoLoc + " → " + afterLoc);
+                            }
+                        } catch (locErr) {
+                            log.debug("LOC_CLEAR_SKIP", "Line " + i + ": " + locErr.message);
+                        }
+
+                        // ── Clear createpo — prevent auto-PO for dropship-flagged items ──
+                        // Items with isdropshipitem=true auto-populate createpo="DropShip"
+                        // via item sourcing. We must clear it to prevent unwanted PO on save.
+                        try {
+                            var autoCreatePO = so.getCurrentSublistValue({ sublistId: "item", fieldId: "createpo" });
+                            if (autoCreatePO) {
+                                log.debug("CREATEPO_AUTO", "Line " + i + " SKU " + sku + ": sourcing auto-set createpo=" + autoCreatePO);
+
+                                // Try empty string first (works for most select fields)
+                                so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: "", ignoreFieldChange: false });
+
+                                var afterClear = so.getCurrentSublistValue({ sublistId: "item", fieldId: "createpo" });
+                                if (afterClear) {
+                                    // Empty string didn't work — try with explicit blank/space
+                                    log.debug("CREATEPO_RETRY", "\"\" didn't clear (still=" + afterClear + "), trying space...");
+                                    so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: " ", ignoreFieldChange: false });
+                                    afterClear = so.getCurrentSublistValue({ sublistId: "item", fieldId: "createpo" });
+                                }
+
+                                log.debug("CREATEPO_RESULT", "Line " + i + ": " + autoCreatePO + " → " + (afterClear || "(empty)"));
+                            }
+                        } catch (cpErr) {
+                            log.debug("CREATEPO_CLEAR_ERR", "Line " + i + ": " + cpErr.message);
+                        }
 
                         // Quantity
                         so.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: qty });
