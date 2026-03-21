@@ -45,6 +45,31 @@ app.post("/so-test", async (req: any, res: any) => {
     }
 });
 
+// ─── Test SO Flow — create a test SO with hardcoded dropship-flagged items ───
+// GET http://localhost:5002/test-so-flow
+app.get("/test-so-flow", async (_req: any, res: any) => {
+    try {
+        const testId = "TEST-SO-" + Date.now();
+        const result = await postToNetsuite({
+            action:              "skip",
+            otherrefnum:         testId,
+            trandate:            new Date().toISOString(),
+            store_type:          "amazon",
+            order_status:        "Unshipped",
+            fulfillment_channel: "MFN",
+            ship_date:           null,
+            items: [
+                { item: "29S0100", quantity: 2, amount: 137.62 },
+            ],
+            po: []
+        });
+        log.info(`[TEST-SO-FLOW] Created SO otherrefnum=${testId}`);
+        res.json({ success: true, testId, ...result });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e?.response?.data || e.message });
+    }
+});
+
 // ─── Manual trigger: migrate old records to new schema ───────────────────────
 // GET http://localhost:5002/migrate-so
 app.get("/migrate-so", async (_req: any, res: any) => {
@@ -337,9 +362,9 @@ app.post("/cleanup", async (_req: any, res: any) => {
 app.post("/test-po-flow", async (req: any, res: any) => {
     try {
         const poType = req.query.type || "dropship";
-        const testId = "TEST-SO-" + 918273645;
+        const testId = "TEST-SO-" + 542865234;
 
-        const testPoNum = 987612345;
+        const testPoNum = 542865234;
         const poPayload: any = {
             action:   "update",
             po_type:  poType === "stocking" ? "Stocking" : "Dropship",
@@ -377,7 +402,7 @@ app.post("/test-po-flow", async (req: any, res: any) => {
                 website_order_number:     testId,
                 stocking_warehouse:       "",
                 order_items: [
-                    { sku: "29S0100", qty: 2, cost: 68.81 },
+                    { sku: "29S0100", qty: 1, cost: 68.81 },
                 ],
             });
         }
