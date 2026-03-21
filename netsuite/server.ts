@@ -2,6 +2,7 @@ import app from "./app";
 import dotenv from "dotenv";
 import cron from "node-cron";
 import log from "./config/logger.config";
+import { getDb } from "./config/mongdodb.config";
 import { stageSalesOrders } from "./services/sales_order.stage";
 import { syncSalesOrdersToNetsuite, retryFailedSalesOrders } from "./services/sales_order.sync";
 import { migrateSalesOrderSchema } from "./services/sales_order.migrate";
@@ -10,7 +11,7 @@ import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "./servi
 import { callDiagnostic, callCleanup, postToNetsuite, postToNetsuiteForPO, postToNetsuiteForBill } from "./services/netsuite.client";
 import { syncNetsuiteItems } from "./controller/netsuite_item";
 import { syncNetsuitePOs } from "./controller/netsuite_po";
-import { syncNetsuiteItemsFull, runItemSublistsSync } from "./controller/netsuite_item_full";
+import { syncNetsuiteItemsFull, runItemSublistsSync, runItemFullSync } from "./controller/netsuite_item_full";
 
 dotenv.config();
 
@@ -422,6 +423,58 @@ app.post("/test-po-flow", async (req: any, res: any) => {
     }
 });
 
+// ─── Reset SO sync flags — clears all NetSuite sync tags so automation re-syncs ──
+// GET  http://localhost:5002/reset-so-sync            → dry-run (shows count)
+// POST http://localhost:5002/reset-so-sync            → actually reset
+app.get("/reset-so-sync", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const count = await col.countDocuments({
+            $or: [
+                { ns_synced: true },
+                { ns_failed: true },
+                { ns_error: { $exists: true } },
+                { ns_retry_count: { $exists: true } },
+            ]
+        });
+        res.json({ success: true, action: "dry_run", orders_with_sync_flags: count });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post("/reset-so-sync", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const result = await col.updateMany(
+            {},
+            {
+                $set: { ns_synced: false },
+                $unset: {
+                    ns_synced_at: "",
+                    ns_result: "",
+                    ns_error: "",
+                    ns_error_at: "",
+                    ns_retry_count: "",
+                    ns_failed: "",
+                }
+            }
+        );
+        log.info(`[RESET-SO-SYNC] Reset ${result.modifiedCount} orders`);
+        res.json({
+            success: true,
+            action: "reset",
+            matched: result.matchedCount,
+            modified: result.modifiedCount,
+        });
+    } catch (e: any) {
+        log.error("[RESET-SO-SYNC] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 const PORT = 5002;
 app.listen(PORT, () => {
     log.info(`Server running at http://localhost:${PORT}`);
@@ -441,13 +494,13 @@ app.listen(PORT, () => {
 });
 
 // ─── CRON: Every 30 mins — Sales Orders ──────────────────────────────────────
-cron.schedule("*/30 * * * *", async () => {
-    log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-    await stageSalesOrders();
+// cron.schedule("*/30 * * * *", async () => {
+//     log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+//     await stageSalesOrders();
 
-    log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-    await syncSalesOrdersToNetsuite();
-});
+//     log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+//     await syncSalesOrdersToNetsuite();
+// });
 
 // // ─── CRON: Every 30 mins — Purchase Orders (shipped or has invoice) ───────────
 // cron.schedule("*/30 * * * *", async () => {
@@ -457,6 +510,52 @@ cron.schedule("*/30 * * * *", async () => {
 //     log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
 //     await syncPurchaseOrdersToNetsuite();
 // });
+
+// ─── CRON: Daily at 3 AM — Auto-retry permanently failed SOs ─────────────
+// Resets ns_failed orders so the regular SO sync cron picks them up again.
+cron.schedule("0 3 * * *", async () => {
+    log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
+    try {
+        const result = await retryFailedSalesOrders(true);
+        log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
+    } catch (err: any) {
+        log.error("[CRON] [SO-RETRY] Error", { error: err.message });
+    }
+});
+
+// ─── CRON: Every 2 hours — Item Sync (SuiteQL, 5000/page, 3 parallel) ────────
+// First run = full sync (96k items ≈ 30s). Subsequent = incremental (only modified items).
+// Also runs once on startup (30s delay to let DB connect).
+cron.schedule("0 */2 * * *", async () => {
+    log.info("[CRON] [ITEM-FULL] Starting item sync...");
+    try {
+        const result = await runItemFullSync(4000, "fast");
+        log.info(`[CRON] [ITEM-FULL] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}, incremental: ${result.incremental}`);
+    } catch (err: any) {
+        log.error("[CRON] [ITEM-FULL] Error", { error: err.message });
+    }
+});
+
+// ─── STARTUP: Kick off full item sync if needed ──────────────────────────────
+setTimeout(async () => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const count = await nsDb.collection("netsuite_items_full").countDocuments();
+        const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
+        const lastTotal = (meta as any)?.total || 0;
+        const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
+
+        if (needsSync) {
+            log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}, last total: ${lastTotal}, completedAt: ${meta?.completedAt || "never"} — running full sync...`);
+            const result = await runItemFullSync(4000, "fast");
+            log.info(`[STARTUP] [ITEM-FULL] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
+        } else {
+            log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
+        }
+    } catch (err: any) {
+        log.error("[STARTUP] [ITEM-FULL] Error", { error: err.message });
+    }
+}, 30_000);
 
 // ─── CRON: Every hour — Item Sublists (Locations + Vendors) ─────────────────
 cron.schedule("0 * * * *", async () => {

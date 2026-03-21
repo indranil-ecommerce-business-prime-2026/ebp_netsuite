@@ -17,7 +17,7 @@ import log from "../config/logger.config";
 export const syncNetsuiteItemsFull = async (req: Request, res: Response) => {
     const mode = (req.query.mode as string) || "fast";
     const maxPageSize = mode === "fast" ? 5000 : 1000;
-    const defaultPageSize = mode === "fast" ? 2000 : 500;
+    const defaultPageSize = mode === "fast" ? 4000 : 500;
     const pageSize = Math.min(Number(req.query.pageSize) || defaultPageSize, maxPageSize);
 
     try {
@@ -29,14 +29,37 @@ export const syncNetsuiteItemsFull = async (req: Request, res: Response) => {
     }
 };
 
+// ── Shared concurrency helper ─────────────────────────────────────────────
+async function runWithConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+    const results: T[] = [];
+    let index = 0;
+    async function worker() {
+        while (index < tasks.length) {
+            const i = index++;
+            results[i] = await tasks[i]();
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, () => worker()));
+    return results;
+}
+
 /**
  * Phase 1 core — callable from both endpoint and cron.
  * mode = "fast"   → SuiteQL via fetch_items_fast (up to 5000/page, OFFSET pagination)
  * mode = "search" → N/search via fetch_all_items_full (up to 1000/page, runPaged)
  *
  * If "fast" fails on page 0, automatically retries with "search" mode.
+ *
+ * Performance (96k items):
+ *   pageSize=4000 + 3 parallel workers → ~24 pages / 3 = ~8 rounds ≈ 35s
+ *   vs old serial 2000/page → 48 pages × 4s ≈ 3-4 min
+ *
+ * Governance: 20 units/call (0.4% of 5,000 limit). Safe for parallel.
+ * pageSize capped at 4000 to stay within ~7 MB response payload (limit ~10-15 MB).
  */
-export async function runItemFullSync(pageSize = 2000, mode = "fast") {
+const PARALLEL_PAGE_FETCHES = 3;
+
+export async function runItemFullSync(pageSize = 4000, mode = "fast") {
     const nsDb = await getDb("netsuite");
     const col = nsDb.collection("netsuite_items_full");
 
@@ -48,142 +71,134 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
 
     const PAGE_MAX_RETRIES = 3;
 
-    // ── Resume + Incremental: check last sync metadata ──
+    // ── Incremental: check last sync metadata ──
     const metaCol = nsDb.collection("sync_metadata");
     const lastRun = await metaCol.findOne({ _id: "item_full_sync" } as any);
 
-    // Resume from interrupted page if sync didn't complete
-    let page = lastRun?.lastCompletedPage != null ? lastRun.lastCompletedPage + 1 : 0;
-
     // Incremental: only fetch items modified since last completed sync
     // First run (no completedAt) = full sync. Subsequent runs = incremental.
+    // Safety: verify DB count is at least 80% of last known total before going incremental.
     let modifiedSince: string | undefined;
-    if (page === 0 && lastRun?.completedAt && mode === "fast") {
-        // Format: "YYYY-MM-DD HH:MM:SS" for SuiteQL
-        const d = new Date(lastRun.completedAt);
-        modifiedSince = d.toISOString().replace("T", " ").substring(0, 19);
-        log.info(`[${label}] Incremental sync — only items modified since ${modifiedSince}`);
-    }
-
-    if (page > 0) {
-        log.info(`[${label}] Resuming from page ${page} (last run stopped at page ${page - 1})`);
+    if (lastRun?.completedAt && mode === "fast") {
+        const dbCount = await col.countDocuments();
+        const lastTotal = lastRun?.total || 0;
+        if (lastTotal > 0 && dbCount < lastTotal * 0.8) {
+            log.warn(`[${label}] DB has ${dbCount} items but last sync reported ${lastTotal} — forcing full sync`);
+            await metaCol.updateOne(
+                { _id: "item_full_sync" } as any,
+                { $set: { lastCompletedPage: null, completedAt: null } },
+                { upsert: true }
+            );
+        } else {
+            const d = new Date(lastRun.completedAt);
+            modifiedSince = d.toISOString().replace("T", " ").substring(0, 19);
+            log.info(`[${label}] Incremental sync — only items modified since ${modifiedSince} (DB: ${dbCount}, last total: ${lastTotal})`);
+        }
     }
 
     let totalInserted = 0;
     let totalUpdated = 0;
     let totalPulled = 0;
     let failedPages: number[] = [];
-    let done = false;
 
-    while (!done) {
-        log.info(`[${label}] Fetching page ${page} (pageSize: ${pageSize})...`);
+    // ── Step 1: Fetch page 0 to get total count + handle fallback ──
+    log.info(`[${label}] Fetching page 0 (pageSize: ${pageSize})...`);
+    const page0Result = await fetchOnePage(section, label, mode, 0, pageSize, modifiedSince, PAGE_MAX_RETRIES);
 
-        let response: any;
-        let pageSuccess = false;
-
-        for (let attempt = 1; attempt <= PAGE_MAX_RETRIES; attempt++) {
-            try {
-                response = await callDiagnostic({
-                    sections: [section],
-                    page,
-                    pageSize,
-                    ...(modifiedSince ? { modifiedSince } : {}),
-                });
-                pageSuccess = true;
-                break;
-            } catch (err: any) {
-                // If fast mode fails on page 0, fall back to search mode
-                if (mode === "fast" && page === 0) {
-                    log.warn(`[${label}] SuiteQL failed, falling back to N/search mode: ${err.message}`);
-                    return runItemFullSync(Math.min(pageSize, 1000), "search");
-                }
-                log.error(`[${label}] Page ${page} attempt ${attempt}/${PAGE_MAX_RETRIES} failed: ${err.message}`);
-                if (attempt < PAGE_MAX_RETRIES) {
-                    await new Promise(r => setTimeout(r, 2000 * attempt)); // 2s, 4s backoff
-                }
-            }
-        }
-
-        if (!pageSuccess) {
-            log.error(`[${label}] Page ${page} failed after ${PAGE_MAX_RETRIES} retries — skipping`);
-            failedPages.push(page);
-            page++;
-            // Can't determine done without a response — keep going until we get one
-            continue;
-        }
-
-        const batch = response?.[section];
-
-        if (!batch || batch.error) {
-            // If fast mode fails on page 0 (RESTlet-level error), fall back
-            if (mode === "fast" && page === 0) {
-                log.warn(`[${label}] SuiteQL returned error, falling back to N/search: ${batch?.error}`);
-                return runItemFullSync(Math.min(pageSize, 1000), "search");
-            }
-            log.error(`[${label}] Page ${page} returned error: ${batch?.error} — skipping`);
-            failedPages.push(page);
-            page++;
-            continue;
-        }
-
-        const items: any[] = batch.items || [];
-        totalPulled += items.length;
-
-        if (items.length > 0) {
-            const ops = items
-                .filter((item: any) => item.itemid)
-                .map((item: any) => {
-                    // Build class object with l1, l2, l3 from "L1 : L2 : L3" text
-                    const classText = (item.class_text || "").trim();
-                    const classParts = classText ? classText.split(":").map((s: string) => s.trim()) : [];
-                    item._class = {
-                        id: item.class || null,
-                        text: classText || null,
-                        l1: classParts[0] || null,
-                        l2: classParts[1] || null,
-                        l3: classParts[2] || null,
-                    };
-
-                    return {
-                        updateOne: {
-                            filter: { itemid: item.itemid },
-                            update: {
-                                $set: { ...item, updated_at: new Date() },
-                                $setOnInsert: { created_at: new Date() },
-                            },
-                            upsert: true,
-                        },
-                    };
-                });
-
-            if (ops.length > 0) {
-                const bulkResult: any = await col.bulkWrite(ops, { ordered: false });
-                totalInserted += bulkResult.upsertedCount ?? 0;
-                totalUpdated += bulkResult.modifiedCount ?? 0;
-            }
-        }
-
-        if (batch.skippedFields && batch.skippedFields.length > 0 && page === 0) {
-            log.warn(`[${label}] Skipped fields: ${batch.skippedFields.join(", ")}`);
-        }
-
-        log.info(`[${label}] Page ${page}: ${items.length} items (total: ${totalPulled}/${batch.total})`);
-
-        // Save progress after each successful page
-        await metaCol.updateOne(
-            { _id: "item_full_sync" } as any,
-            { $set: { lastCompletedPage: page, lastPageAt: new Date(), total: batch.total, pageSize } },
-            { upsert: true }
-        );
-
-        done = batch.done || items.length === 0;
-        page++;
+    if (page0Result.fallback) {
+        return runItemFullSync(Math.min(pageSize, 1000), "search");
     }
 
-    // Reset resume pointer on completion so next run starts fresh
+    if (!page0Result.success) {
+        log.error(`[${label}] Page 0 failed — aborting sync`);
+        return { success: false, mode, totalPulled: 0, inserted: 0, updated: 0, pages: 0 };
+    }
+
+    const batch0 = page0Result.batch;
+    const items0: any[] = batch0.items || [];
+    totalPulled += items0.length;
+
+    if (items0.length > 0) {
+        const r = await upsertItems(col, items0);
+        totalInserted += r.inserted;
+        totalUpdated += r.updated;
+    }
+
+    if (batch0.skippedFields?.length > 0) {
+        log.warn(`[${label}] Skipped fields: ${batch0.skippedFields.join(", ")}`);
+    }
+
+    const totalItems = batch0.total || items0.length;
+    const totalPages = Math.ceil(totalItems / pageSize);
+    log.info(`[${label}] Page 0: ${items0.length} items. Total: ${totalItems} items across ${totalPages} pages`);
+
+    // ── Step 2: Fetch remaining pages in parallel ──
+    if (totalPages > 1 && !batch0.done && items0.length > 0) {
+        const pageTasks: (() => Promise<void>)[] = [];
+
+        for (let p = 1; p < totalPages; p++) {
+            const pageNum = p;
+            pageTasks.push(async () => {
+                const result = await fetchOnePage(section, label, mode, pageNum, pageSize, modifiedSince, PAGE_MAX_RETRIES);
+
+                if (!result.success) {
+                    failedPages.push(pageNum);
+                    log.warn(`[${label}] Page ${pageNum} failed after ${PAGE_MAX_RETRIES} retries`);
+                    return;
+                }
+
+                const items: any[] = result.batch.items || [];
+                totalPulled += items.length;
+
+                if (items.length > 0) {
+                    const r = await upsertItems(col, items);
+                    totalInserted += r.inserted;
+                    totalUpdated += r.updated;
+                }
+
+                log.info(`[${label}] Page ${pageNum}: ${items.length} items (running total: ${totalPulled}/${totalItems})`);
+            });
+        }
+
+        log.info(`[${label}] Fetching ${pageTasks.length} remaining pages (${PARALLEL_PAGE_FETCHES} parallel workers)...`);
+        await runWithConcurrency(pageTasks, PARALLEL_PAGE_FETCHES);
+    }
+
+    // ── Step 3: Retry failed pages once more ──
+    if (failedPages.length > 0) {
+        log.info(`[${label}] Retrying ${failedPages.length} failed pages: [${failedPages.join(", ")}]`);
+        const stillFailed: number[] = [];
+
+        for (const fp of failedPages) {
+            const retryResult = await fetchOnePage(section, label, mode, fp, pageSize, modifiedSince, PAGE_MAX_RETRIES);
+
+            if (!retryResult.success || retryResult.fallback) {
+                stillFailed.push(fp);
+                continue;
+            }
+
+            const items: any[] = retryResult.batch.items || [];
+            totalPulled += items.length;
+
+            if (items.length > 0) {
+                const r = await upsertItems(col, items);
+                totalInserted += r.inserted;
+                totalUpdated += r.updated;
+            }
+
+            log.info(`[${label}] Retry page ${fp}: ${items.length} items recovered`);
+        }
+
+        failedPages = stillFailed;
+        if (failedPages.length > 0) {
+            log.warn(`[${label}] ${failedPages.length} pages still failed after retry: [${failedPages.join(", ")}]`);
+        }
+    }
+
+    // ── Save completion metadata ──
     await metaCol.updateOne(
         { _id: "item_full_sync" } as any,
-        { $set: { lastCompletedPage: null, completedAt: new Date(), totalPulled, failedPages } },
+        { $set: { lastCompletedPage: null, completedAt: new Date(), total: totalItems, totalPulled, failedPages, pageSize } },
         { upsert: true }
     );
 
@@ -197,8 +212,78 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
         totalPulled,
         inserted: totalInserted,
         updated: totalUpdated,
-        pages: page,
+        pages: totalPages,
         failedPages: failedPages.length > 0 ? failedPages : undefined,
+    };
+}
+
+// ── Helper: fetch one page from NetSuite with retries ─────────────────────
+async function fetchOnePage(
+    section: string,
+    label: string,
+    mode: string,
+    page: number,
+    pageSize: number,
+    modifiedSince: string | undefined,
+    maxRetries: number
+): Promise<{ success: boolean; fallback?: boolean; batch?: any }> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const payload: any = { sections: [section], page, pageSize };
+            if (modifiedSince && mode === "fast") {
+                payload.modifiedSince = modifiedSince;
+            }
+
+            const response = await callDiagnostic(payload);
+            const batch = response?.[section];
+
+            if (!batch || batch.error) {
+                const errMsg = batch?.error || "RESTlet returned no data";
+                log.warn(`[${label}] Page ${page} attempt ${attempt}/${maxRetries} failed: ${errMsg}`);
+
+                // SuiteQL failed on first page → fallback to N/search
+                if (mode === "fast" && page === 0 && attempt === maxRetries) {
+                    log.warn(`[${label}] SuiteQL failed on page 0 after ${maxRetries} attempts — falling back to N/search`);
+                    return { success: false, fallback: true };
+                }
+                continue;
+            }
+
+            return { success: true, batch };
+        } catch (err: any) {
+            log.warn(`[${label}] Page ${page} attempt ${attempt}/${maxRetries} error: ${err.message}`);
+
+            if (mode === "fast" && page === 0 && attempt === maxRetries) {
+                log.warn(`[${label}] SuiteQL failed on page 0 after ${maxRetries} attempts — falling back to N/search`);
+                return { success: false, fallback: true };
+            }
+        }
+    }
+
+    return { success: false };
+}
+
+// ── Helper: upsert items into MongoDB via bulkWrite ───────────────────────
+async function upsertItems(col: any, items: any[]): Promise<{ inserted: number; updated: number }> {
+    const ops = items
+        .filter((item: any) => item.itemid)
+        .map((item: any) => ({
+            updateOne: {
+                filter: { itemid: item.itemid },
+                update: {
+                    $set: { ...item, _synced_at: new Date() },
+                    $setOnInsert: { _created_at: new Date() },
+                },
+                upsert: true,
+            },
+        }));
+
+    if (ops.length === 0) return { inserted: 0, updated: 0 };
+
+    const result: any = await col.bulkWrite(ops, { ordered: false });
+    return {
+        inserted: result.upsertedCount ?? 0,
+        updated: result.modifiedCount ?? 0,
     };
 }
 
@@ -214,19 +299,6 @@ export async function runItemFullSync(pageSize = 2000, mode = "fast") {
  */
 const SUBLISTS_BATCH_SIZE = 500;
 const PARALLEL_RESTLET_CALLS = 3;
-
-async function runWithConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
-    const results: T[] = [];
-    let index = 0;
-    async function worker() {
-        while (index < tasks.length) {
-            const i = index++;
-            results[i] = await tasks[i]();
-        }
-    }
-    await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, () => worker()));
-    return results;
-}
 
 export async function runItemSublistsSync(batchSize = SUBLISTS_BATCH_SIZE) {
     const nsDb = await getDb("netsuite");
