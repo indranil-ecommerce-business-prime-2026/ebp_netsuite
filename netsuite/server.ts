@@ -69,24 +69,24 @@ app.listen(PORT, () => {
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
 let soSyncRunning = false;
 
-cron.schedule("*/30 * * * *", async () => {
-    if (soSyncRunning) {
-        log.warn("[CRON] [SO] Skipping — previous sync still running");
-        return;
-    }
-    soSyncRunning = true;
-    try {
-        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-        await stageSalesOrders();
+// cron.schedule("*/30 * * * *", async () => {
+//     if (soSyncRunning) {
+//         log.warn("[CRON] [SO] Skipping — previous sync still running");
+//         return;
+//     }
+//     soSyncRunning = true;
+//     try {
+//         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+//         await stageSalesOrders();
 
-        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-        await syncSalesOrdersToNetsuite();
-    } catch (err: any) {
-        log.error("[CRON] [SO] Error", { error: err.message });
-    } finally {
-        soSyncRunning = false;
-    }
-});
+//         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+//         await syncSalesOrdersToNetsuite();
+//     } catch (err: any) {
+//         log.error("[CRON] [SO] Error", { error: err.message });
+//     } finally {
+//         soSyncRunning = false;
+//     }
+// });
 
 // ─── Every 30 mins — Purchase Orders (shipped or invoiced) ──────────────────
 // cron.schedule("*/30 * * * *", async () => {
@@ -98,15 +98,15 @@ cron.schedule("*/30 * * * *", async () => {
 // });
 
 // ─── Daily 3 AM — Auto-retry permanently failed SOs ─────────────────────────
-cron.schedule("0 3 * * *", async () => {
-    log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
-    try {
-        const result = await retryFailedSalesOrders(true);
-        log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
-    } catch (err: any) {
-        log.error("[CRON] [SO-RETRY] Error", { error: err.message });
-    }
-});
+// cron.schedule("0 3 * * *", async () => {
+//     log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
+//     try {
+//         const result = await retryFailedSalesOrders(true);
+//         log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
+//     } catch (err: any) {
+//         log.error("[CRON] [SO-RETRY] Error", { error: err.message });
+//     }
+// });
 
 // ─── Every 30 mins — Item Sync (Phase 1 + Phase 2 chained) ──────────────────
 // Phase 1: SuiteQL bulk fetch (5 parallel workers, 5000/page → ~12-16s for 96k)

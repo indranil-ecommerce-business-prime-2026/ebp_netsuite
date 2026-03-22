@@ -386,7 +386,7 @@ export async function runItemSublistsSync(batchSize = SUBLISTS_BATCH_SIZE) {
                         .filter((slItem: any) => !slItem.error)
                         .map((slItem: any) => ({
                             updateOne: {
-                                filter: { internalid: String(slItem.internalid) },
+                                filter: { internalid: slItem.internalid },
                                 update: {
                                     $set: {
                                         _locations: slItem.locations,
