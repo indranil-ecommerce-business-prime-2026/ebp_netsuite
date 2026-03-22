@@ -63,8 +63,8 @@ export async function runItemFullSync(pageSize = 4000, mode = "fast") {
     const nsDb = await getDb("netsuite");
     const col = nsDb.collection("netsuite_items_full");
 
-    await col.createIndex({ itemid: 1 }, { unique: true });
-    await col.createIndex({ internalid: 1 });
+    await col.createIndex({ internalid: 1 }, { unique: true });
+    await col.createIndex({ itemid: 1 });
 
     const section = mode === "fast" ? "fetch_items_fast" : "fetch_all_items_full";
     const label = mode === "fast" ? "ITEM-FAST" : "ITEM-FULL";
@@ -266,10 +266,10 @@ async function fetchOnePage(
 // ── Helper: upsert items into MongoDB via bulkWrite ───────────────────────
 async function upsertItems(col: any, items: any[]): Promise<{ inserted: number; updated: number }> {
     const ops = items
-        .filter((item: any) => item.itemid)
+        .filter((item: any) => item.internalid)
         .map((item: any) => ({
             updateOne: {
-                filter: { itemid: item.itemid },
+                filter: { internalid: item.internalid },
                 update: {
                     $set: { ...item, _synced_at: new Date() },
                     $setOnInsert: { _created_at: new Date() },

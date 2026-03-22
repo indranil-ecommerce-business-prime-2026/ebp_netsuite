@@ -47,14 +47,16 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         "walmart":         "Walmart",
         "newegg":          "NewEgg",
         "newegg_business": "NewEgg Business",
-        "ebay":            "eBay"
+        "ebay":            "eBay",
+        "shopify":         "Shopify"
     };
 
     var CHANNEL_MAP = {
         "amazon":          "3rd Party Marketplace : Amazon",
         "walmart":         "3rd Party Marketplace : Walmart",
         "newegg":          "3rd Party Marketplace : NewEgg",
-        "ebay":            "3rd Party Marketplace : eBay"
+        "ebay":            "3rd Party Marketplace : eBay",
+        "shopify":         "3rd Party Marketplace : Shopify"
     };
 
     var FORM_NAME = "Ecomm BP - Sales Order";
@@ -181,6 +183,45 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             // Custom fields
             try { so.setValue({ fieldId: "custbody1", value: String(order_status) }); } catch (e) {}
             try { so.setValue({ fieldId: "custbody3", value: String(fulfillment_channel) }); } catch (e) {}
+
+            // ── Shipping Address (shippingaddress subrecord) ─────────────
+            var shipping = payload.shipping_address;
+            if (shipping && (shipping.addr1 || shipping.city || shipping.state || shipping.zip)) {
+                try {
+                    var addrSubrecord = so.getSubrecord({ fieldId: "shippingaddress" });
+
+                    // Country FIRST — controls state/zip validation in NetSuite
+                    if (shipping.country) {
+                        addrSubrecord.setValue({ fieldId: "country", value: shipping.country });
+                    }
+                    if (shipping.addressee) {
+                        addrSubrecord.setValue({ fieldId: "addressee", value: shipping.addressee });
+                    }
+                    if (shipping.company) {
+                        addrSubrecord.setValue({ fieldId: "attention", value: shipping.company });
+                    }
+                    if (shipping.addr1) {
+                        addrSubrecord.setValue({ fieldId: "addr1", value: shipping.addr1 });
+                    }
+                    if (shipping.addr2) {
+                        addrSubrecord.setValue({ fieldId: "addr2", value: shipping.addr2 });
+                    }
+                    if (shipping.city) {
+                        addrSubrecord.setValue({ fieldId: "city", value: shipping.city });
+                    }
+                    if (shipping.state) {
+                        addrSubrecord.setValue({ fieldId: "state", value: shipping.state });
+                    }
+                    if (shipping.zip) {
+                        addrSubrecord.setValue({ fieldId: "zip", value: shipping.zip });
+                    }
+
+                    log.debug("SHIPPING_ADDR_SET", JSON.stringify(shipping));
+                } catch (addrErr) {
+                    // Non-fatal: don't fail the entire SO for an address error
+                    log.error("SHIPPING_ADDR_ERR", addrErr.message);
+                }
+            }
 
             // Memo — intentionally not set (leave blank)
 
@@ -540,6 +581,23 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         for (var hi = 0; hi < headerFields.length; hi++) {
             try { snap.header[headerFields[hi]] = soRecord.getValue({ fieldId: headerFields[hi] }); } catch (e) {}
         }
+        // Capture shipping address subrecord
+        try {
+            var addrRec = soRecord.getSubrecord({ fieldId: "shippingaddress" });
+            snap.header.shippingAddress = {
+                addressee: addrRec.getValue({ fieldId: "addressee" }) || "",
+                attention: addrRec.getValue({ fieldId: "attention" }) || "",
+                addr1: addrRec.getValue({ fieldId: "addr1" }) || "",
+                addr2: addrRec.getValue({ fieldId: "addr2" }) || "",
+                city: addrRec.getValue({ fieldId: "city" }) || "",
+                state: addrRec.getValue({ fieldId: "state" }) || "",
+                zip: addrRec.getValue({ fieldId: "zip" }) || "",
+                country: addrRec.getValue({ fieldId: "country" }) || ""
+            };
+        } catch (addrSnapErr) {
+            snap.header.shippingAddress = null;
+        }
+
         var lineCount = soRecord.getLineCount({ sublistId: "item" });
         snap.header.lineCount = lineCount;
         var lineFields = ["item", "quantity", "rate", "amount", "location", "price", "description"];
