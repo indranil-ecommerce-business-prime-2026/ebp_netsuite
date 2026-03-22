@@ -17,7 +17,7 @@ import log from "../config/logger.config";
 export const syncNetsuiteItemsFull = async (req: Request, res: Response) => {
     const mode = (req.query.mode as string) || "fast";
     const maxPageSize = mode === "fast" ? 5000 : 1000;
-    const defaultPageSize = mode === "fast" ? 4000 : 500;
+    const defaultPageSize = mode === "fast" ? 5000 : 500;
     const pageSize = Math.min(Number(req.query.pageSize) || defaultPageSize, maxPageSize);
 
     try {
@@ -51,15 +51,15 @@ async function runWithConcurrency<T>(tasks: (() => Promise<T>)[], limit: number)
  * If "fast" fails on page 0, automatically retries with "search" mode.
  *
  * Performance (96k items):
- *   pageSize=4000 + 3 parallel workers → ~24 pages / 3 = ~8 rounds ≈ 35s
+ *   pageSize=5000 + 5 parallel workers → ~20 pages / 5 = ~4 rounds ≈ 12-16s
  *   vs old serial 2000/page → 48 pages × 4s ≈ 3-4 min
  *
- * Governance: 20 units/call (0.4% of 5,000 limit). Safe for parallel.
- * pageSize capped at 4000 to stay within ~7 MB response payload (limit ~10-15 MB).
+ * Governance: 20 units/call (0.4% of 5,000 limit). 5 parallel = 100 units/round — safe.
+ * pageSize 5000 is the SuiteQL max. Response ~8-9 MB (under ~10-15 MB limit).
  */
-const PARALLEL_PAGE_FETCHES = 3;
+const PARALLEL_PAGE_FETCHES = 5;
 
-export async function runItemFullSync(pageSize = 4000, mode = "fast") {
+export async function runItemFullSync(pageSize = 5000, mode = "fast") {
     const nsDb = await getDb("netsuite");
     const col = nsDb.collection("netsuite_items_full");
 

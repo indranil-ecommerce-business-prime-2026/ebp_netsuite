@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import cron from "node-cron";
 import log from "./config/logger.config";
 import { getDb } from "./config/mongdodb.config";
-import { retryFailedSalesOrders } from "./services/sales_order.sync";
+import { retryFailedSalesOrders, syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
 // Used by commented-out cron jobs — uncomment when ready for production
 // import { stageSalesOrders } from "./services/sales_order.stage";
 // import { syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
@@ -16,6 +16,7 @@ import soRoutes from "./route/so.route";
 import poRoutes from "./route/po.route";
 import diagnosticRoutes from "./route/diagnostic.route";
 import itemRoutes from "./route/item.route";
+import { stageSalesOrders } from "./services/sales_order.stage";
 
 dotenv.config();
 
@@ -66,13 +67,13 @@ app.listen(PORT, () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
-// cron.schedule("*/30 * * * *", async () => {
-//     log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-//     await stageSalesOrders();
-//
-//     log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-//     await syncSalesOrdersToNetsuite();
-// });
+cron.schedule("*/30 * * * *", async () => {
+    log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+    await stageSalesOrders();
+
+    log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+    await syncSalesOrdersToNetsuite();
+});
 
 // ─── Every 30 mins — Purchase Orders (shipped or invoiced) ──────────────────
 // cron.schedule("*/30 * * * *", async () => {
@@ -94,49 +95,56 @@ cron.schedule("0 3 * * *", async () => {
     }
 });
 
-// ─── Every 2 hours — Item Full Sync (SuiteQL) ──────────────────────────────
-cron.schedule("0 */2 * * *", async () => {
-    log.info("[CRON] [ITEM-FULL] Starting item sync...");
+// ─── Every 30 mins — Item Sync (Phase 1 + Phase 2 chained) ──────────────────
+// Phase 1: SuiteQL bulk fetch (5 parallel workers, 5000/page → ~12-16s for 96k)
+// Phase 2: Sublists — only runs when Phase 1 pulled new/updated items
+// Incremental runs are near-instant — safe to run every 30 min.
+let itemSyncRunning = false;
+
+cron.schedule("10,35 * * * *", async () => {
+    if (itemSyncRunning) {
+        log.warn("[CRON] [ITEM] Skipping — previous sync still running");
+        return;
+    }
+    itemSyncRunning = true;
     try {
-        const result = await runItemFullSync(4000, "fast");
-        log.info(`[CRON] [ITEM-FULL] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}, incremental: ${result.incremental}`);
+        log.info("[CRON] [ITEM] Phase 1 — Syncing items...");
+        const result = await runItemFullSync();
+        log.info(`[CRON] [ITEM] Phase 1 done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}, incremental: ${result.incremental}`);
+
+        if (result.totalPulled > 0) {
+            log.info("[CRON] [ITEM] Phase 2 — Fetching sublists for updated items...");
+            const slResult = await runItemSublistsSync();
+            log.info(`[CRON] [ITEM] Phase 2 done. Updated: ${slResult.updated}/${slResult.total}`);
+        }
     } catch (err: any) {
-        log.error("[CRON] [ITEM-FULL] Error", { error: err.message });
+        log.error("[CRON] [ITEM] Error", { error: err.message });
+    } finally {
+        itemSyncRunning = false;
     }
 });
-
-// ─── Every hour — Item Sublists (Locations + Vendors) ───────────────────────
-// cron.schedule("0 * * * *", async () => {
-//     log.info("[CRON] [ITEM-SUBLISTS] Fetching Location/Vendor sublists for inventory items...");
-//     try {
-//         const result = await runItemSublistsSync();
-//         log.info(`[CRON] [ITEM-SUBLISTS] Done. Updated: ${result.updated}/${result.total}`);
-//     } catch (err: any) {
-//         log.error("[CRON] [ITEM-SUBLISTS] Error", { error: err.message });
-//     }
-// });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Kick off full item sync if DB is empty or stale (30s delay for DB connection)
-// setTimeout(async () => {
-//     try {
-//         const nsDb = await getDb("netsuite");
-//         const count = await nsDb.collection("netsuite_items_full").countDocuments();
-//         const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
-//         const lastTotal = (meta as any)?.total || 0;
-//         const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
+// Kick off full item sync if DB is empty or stale (10s delay for DB connection)
+setTimeout(async () => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const count = await nsDb.collection("netsuite_items_full").countDocuments();
+        const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
+        const lastTotal = (meta as any)?.total || 0;
+        const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
 
-//         if (needsSync) {
-//             log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}, last total: ${lastTotal}, completedAt: ${meta?.completedAt || "never"} — running full sync...`);
-//             const result = await runItemFullSync(4000, "fast");
-//             log.info(`[STARTUP] [ITEM-FULL] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
-//         } else {
-//             log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
-//         }
-//     } catch (err: any) {
-//         log.error("[STARTUP] [ITEM-FULL] Error", { error: err.message });
-//     }
-// }, 30_000);
+        if (needsSync) {
+            log.info(`[STARTUP] [ITEM] Items in DB: ${count}, last total: ${lastTotal} — running full sync (5 workers, 5000/page)...`);
+            const result = await runItemFullSync();
+            log.info(`[STARTUP] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
+        } else {
+            log.info(`[STARTUP] [ITEM] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
+        }
+    } catch (err: any) {
+        log.error("[STARTUP] [ITEM] Error", { error: err.message });
+    }
+}, 10_000);
