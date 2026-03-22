@@ -67,12 +67,25 @@ app.listen(PORT, () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
-cron.schedule("*/30 * * * *", async () => {
-    log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-    await stageSalesOrders();
+let soSyncRunning = false;
 
-    log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-    await syncSalesOrdersToNetsuite();
+cron.schedule("*/30 * * * *", async () => {
+    if (soSyncRunning) {
+        log.warn("[CRON] [SO] Skipping — previous sync still running");
+        return;
+    }
+    soSyncRunning = true;
+    try {
+        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+        await stageSalesOrders();
+
+        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+        await syncSalesOrdersToNetsuite();
+    } catch (err: any) {
+        log.error("[CRON] [SO] Error", { error: err.message });
+    } finally {
+        soSyncRunning = false;
+    }
 });
 
 // ─── Every 30 mins — Purchase Orders (shipped or invoiced) ──────────────────
@@ -138,13 +151,19 @@ setTimeout(async () => {
         const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
 
         if (needsSync) {
-            log.info(`[STARTUP] [ITEM] Items in DB: ${count}, last total: ${lastTotal} — running full sync (5 workers, 5000/page)...`);
-            const result = await runItemFullSync();
-            log.info(`[STARTUP] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
+            itemSyncRunning = true;
+            try {
+                log.info(`[STARTUP] [ITEM] Items in DB: ${count}, last total: ${lastTotal} — running full sync (5 workers, 5000/page)...`);
+                const result = await runItemFullSync();
+                log.info(`[STARTUP] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
+            } finally {
+                itemSyncRunning = false;
+            }
         } else {
             log.info(`[STARTUP] [ITEM] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
         }
     } catch (err: any) {
         log.error("[STARTUP] [ITEM] Error", { error: err.message });
+        itemSyncRunning = false;
     }
 }, 10_000);
