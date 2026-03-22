@@ -63,6 +63,9 @@ export async function runItemFullSync(pageSize = 4000, mode = "fast") {
     const nsDb = await getDb("netsuite");
     const col = nsDb.collection("netsuite_items_full");
 
+    // Drop stale indexes if they conflict (e.g., non-unique → unique upgrade)
+    try { await col.dropIndex("internalid_1"); } catch (_) {}
+    try { await col.dropIndex("itemid_1"); } catch (_) {}
     await col.createIndex({ internalid: 1 }, { unique: true });
     await col.createIndex({ itemid: 1 });
 
