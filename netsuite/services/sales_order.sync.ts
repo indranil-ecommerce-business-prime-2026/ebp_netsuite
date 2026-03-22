@@ -70,7 +70,8 @@ async function syncOneOrder(collection: any, order: any): Promise<any> {
             fulfillment_channel: order.fulfillment_channel,
             ship_date:           order.ship_date,
             items:               order.items,
-            po:                  order.po
+            po:                  order.po,
+            shipping_address:    order.shipping_address || null,
         });
 
         if (result.action === "no_items") {

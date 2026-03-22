@@ -75,3 +75,36 @@ export const migrateSalesOrderSchema = async (): Promise<{
     log.info(`[SO Migrate] Done — migrated: ${migrated}, total: ${total}`);
     return { migrated, alreadyCurrent: total - migrated, total };
 };
+
+/**
+ * Backfill order_source and shipping_address on existing staged documents.
+ * - Sets order_source = "amazon" where missing (all existing records are from Amazon)
+ * - Sets shipping_address = null where missing
+ *
+ * Safe to run multiple times — only updates records that need it.
+ */
+export const migrateMultiVendorSchema = async (): Promise<{
+    migrated: number;
+    total: number;
+}> => {
+    log.info("[SO Migrate] Starting multi-vendor schema migration...");
+
+    const ns_db = await getDb("netsuite");
+    const collection = ns_db.collection("suite_sales_order");
+
+    const total = await collection.countDocuments();
+
+    // Find records missing the new fields
+    const result = await collection.updateMany(
+        { order_source: { $exists: false } },
+        {
+            $set: {
+                order_source: "amazon",
+                shipping_address: null
+            }
+        }
+    );
+
+    log.info(`[SO Migrate] Multi-vendor migration done — updated: ${result.modifiedCount}, total: ${total}`);
+    return { migrated: result.modifiedCount, total };
+};
