@@ -106,37 +106,37 @@ cron.schedule("0 */2 * * *", async () => {
 });
 
 // ─── Every hour — Item Sublists (Locations + Vendors) ───────────────────────
-cron.schedule("0 * * * *", async () => {
-    log.info("[CRON] [ITEM-SUBLISTS] Fetching Location/Vendor sublists for inventory items...");
-    try {
-        const result = await runItemSublistsSync();
-        log.info(`[CRON] [ITEM-SUBLISTS] Done. Updated: ${result.updated}/${result.total}`);
-    } catch (err: any) {
-        log.error("[CRON] [ITEM-SUBLISTS] Error", { error: err.message });
-    }
-});
+// cron.schedule("0 * * * *", async () => {
+//     log.info("[CRON] [ITEM-SUBLISTS] Fetching Location/Vendor sublists for inventory items...");
+//     try {
+//         const result = await runItemSublistsSync();
+//         log.info(`[CRON] [ITEM-SUBLISTS] Done. Updated: ${result.updated}/${result.total}`);
+//     } catch (err: any) {
+//         log.error("[CRON] [ITEM-SUBLISTS] Error", { error: err.message });
+//     }
+// });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Kick off full item sync if DB is empty or stale (30s delay for DB connection)
-setTimeout(async () => {
-    try {
-        const nsDb = await getDb("netsuite");
-        const count = await nsDb.collection("netsuite_items_full").countDocuments();
-        const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
-        const lastTotal = (meta as any)?.total || 0;
-        const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
+// setTimeout(async () => {
+//     try {
+//         const nsDb = await getDb("netsuite");
+//         const count = await nsDb.collection("netsuite_items_full").countDocuments();
+//         const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
+//         const lastTotal = (meta as any)?.total || 0;
+//         const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
 
-        if (needsSync) {
-            log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}, last total: ${lastTotal}, completedAt: ${meta?.completedAt || "never"} — running full sync...`);
-            const result = await runItemFullSync(4000, "fast");
-            log.info(`[STARTUP] [ITEM-FULL] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
-        } else {
-            log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
-        }
-    } catch (err: any) {
-        log.error("[STARTUP] [ITEM-FULL] Error", { error: err.message });
-    }
-}, 30_000);
+//         if (needsSync) {
+//             log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}, last total: ${lastTotal}, completedAt: ${meta?.completedAt || "never"} — running full sync...`);
+//             const result = await runItemFullSync(4000, "fast");
+//             log.info(`[STARTUP] [ITEM-FULL] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
+//         } else {
+//             log.info(`[STARTUP] [ITEM-FULL] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
+//         }
+//     } catch (err: any) {
+//         log.error("[STARTUP] [ITEM-FULL] Error", { error: err.message });
+//     }
+// }, 30_000);
