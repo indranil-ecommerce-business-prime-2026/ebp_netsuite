@@ -79,10 +79,10 @@ function buildAmazonOrders(
             })),
             po: po_map.get(orderId) || [],
             shipping_address: addr ? {
-                addressee: "",
+                addressee: addr.Name || "",
                 company:   addr.CompanyName || "",
-                addr1:     "",
-                addr2:     "",
+                addr1:     addr.AddressLine1 || "",
+                addr2:     addr.AddressLine2 || "",
                 city:      addr.City || "",
                 state:     addr.StateOrRegion || "",
                 zip:       addr.PostalCode || "",

@@ -45,7 +45,7 @@ const post = async (scriptId: string, deployId: string, payload: object): Promis
             "Content-Type": "application/json"
         }
     });
-    log.debug("[NS Client] Response", { data: response.data });
+    log.debug("[NS Client] Response", { action: response.data?.action, success: response.data?.success, itemCount: response.data?.fetch_items_fast?.count });
     return response.data;
 };
 
