@@ -298,9 +298,12 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
             OrderStatus: { $in: SYNC_STATUSES }
         }).toArray(),
 
-        // 2. TPX orders (store_type lookup for Amazon orders)
+        // 2. TPX orders (store_type lookup — excludes shopify/ebay which have their own adapter)
         tpx_db.collection("tpx_orders").find(
-            { $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }] },
+            {
+                store_type: { $nin: ["shopify", "ebay"] },
+                $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }]
+            },
             { projection: { txn_id: 1, store_type: 1 } }
         ).toArray(),
 
