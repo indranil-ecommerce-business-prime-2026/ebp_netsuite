@@ -9,7 +9,7 @@ import { retryFailedSalesOrders, syncSalesOrdersToNetsuite } from "./services/sa
 // import { syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
 // import { stagePurchaseOrders } from "./services/po.stage";
 // import { syncPurchaseOrdersToNetsuite } from "./services/po.sync";
-import { runItemFullSync, runItemSublistsSync } from "./controller/netsuite_item_full";
+import { runItemFullSync } from "./controller/netsuite_item_full";
 
 // Route modules
 import soRoutes from "./route/so.route";
@@ -69,24 +69,24 @@ app.listen(PORT, () => {
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
 let soSyncRunning = false;
 
-// cron.schedule("*/30 * * * *", async () => {
-//     if (soSyncRunning) {
-//         log.warn("[CRON] [SO] Skipping — previous sync still running");
-//         return;
-//     }
-//     soSyncRunning = true;
-//     try {
-//         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-//         await stageSalesOrders();
+cron.schedule("*/20 * * * *", async () => {
+    if (soSyncRunning) {
+        log.warn("[CRON] [SO] Skipping — previous sync still running");
+        return;
+    }
+    soSyncRunning = true;
+    try {
+        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+        await stageSalesOrders();
 
-//         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-//         await syncSalesOrdersToNetsuite();
-//     } catch (err: any) {
-//         log.error("[CRON] [SO] Error", { error: err.message });
-//     } finally {
-//         soSyncRunning = false;
-//     }
-// });
+        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+        await syncSalesOrdersToNetsuite();
+    } catch (err: any) {
+        log.error("[CRON] [SO] Error", { error: err.message });
+    } finally {
+        soSyncRunning = false;
+    }
+});
 
 // ─── Every 30 mins — Purchase Orders (shipped or invoiced) ──────────────────
 // cron.schedule("*/30 * * * *", async () => {
@@ -114,56 +114,48 @@ let soSyncRunning = false;
 // Incremental runs are near-instant — safe to run every 30 min.
 let itemSyncRunning = false;
 
-cron.schedule("10,35 * * * *", async () => {
-    if (itemSyncRunning) {
-        log.warn("[CRON] [ITEM] Skipping — previous sync still running");
-        return;
-    }
-    itemSyncRunning = true;
-    try {
-        log.info("[CRON] [ITEM] Phase 1 — Syncing items...");
-        const result = await runItemFullSync();
-        log.info(`[CRON] [ITEM] Phase 1 done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}, incremental: ${result.incremental}`);
-
-        if (result.totalPulled > 0) {
-            log.info("[CRON] [ITEM] Phase 2 — Fetching sublists for updated items...");
-            const slResult = await runItemSublistsSync();
-            log.info(`[CRON] [ITEM] Phase 2 done. Updated: ${slResult.updated}/${slResult.total}`);
-        }
-    } catch (err: any) {
-        log.error("[CRON] [ITEM] Error", { error: err.message });
-    } finally {
-        itemSyncRunning = false;
-    }
-});
+// cron.schedule("10,35 * * * *", async () => {
+//     if (itemSyncRunning) {
+//         log.warn("[CRON] [ITEM] Skipping — previous sync still running");
+//         return;
+//     }
+//     itemSyncRunning = true;
+//     try {
+//         log.info("[CRON] [ITEM] Syncing items...");
+//         const result = await runItemFullSync();
+//         log.info(`[CRON] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}, incremental: ${result.incremental}`);
+//     } catch (err: any) {
+//         log.error("[CRON] [ITEM] Error", { error: err.message });
+//     } finally {
+//         itemSyncRunning = false;
+//     }
+// });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Kick off full item sync if DB is empty or stale (10s delay for DB connection)
-setTimeout(async () => {
-    try {
-        const nsDb = await getDb("netsuite");
-        const count = await nsDb.collection("netsuite_items_full").countDocuments();
-        const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
-        const lastTotal = (meta as any)?.total || 0;
-        const needsSync = count === 0 || (lastTotal > 0 && count < lastTotal * 0.8) || !meta?.completedAt;
+// Kick off full item sync if DB is empty or never completed (10s delay for DB connection)
+// setTimeout(async () => {
+//     try {
+//         const nsDb = await getDb("netsuite");
+//         const count = await nsDb.collection("netsuite_items_full").countDocuments();
+//         const meta = await nsDb.collection("sync_metadata").findOne({ _id: "item_full_sync" } as any);
 
-        if (needsSync) {
-            itemSyncRunning = true;
-            try {
-                log.info(`[STARTUP] [ITEM] Items in DB: ${count}, last total: ${lastTotal} — running full sync (5 workers, 5000/page)...`);
-                const result = await runItemFullSync();
-                log.info(`[STARTUP] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
-            } finally {
-                itemSyncRunning = false;
-            }
-        } else {
-            log.info(`[STARTUP] [ITEM] Items in DB: ${count}/${lastTotal} — skipping (next sync via cron)`);
-        }
-    } catch (err: any) {
-        log.error("[STARTUP] [ITEM] Error", { error: err.message });
-        itemSyncRunning = false;
-    }
-}, 10_000);
+//         if (count === 0 || !meta?.completedAt) {
+//             itemSyncRunning = true;
+//             try {
+//                 log.info(`[STARTUP] [ITEM] Items in DB: ${count} — running full sync...`);
+//                 const result = await runItemFullSync();
+//                 log.info(`[STARTUP] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}`);
+//             } finally {
+//                 itemSyncRunning = false;
+//             }
+//         } else {
+//             log.info(`[STARTUP] [ITEM] Items in DB: ${count} — skipping (next sync via cron)`);
+//         }
+//     } catch (err: any) {
+//         log.error("[STARTUP] [ITEM] Error", { error: err.message });
+//         itemSyncRunning = false;
+//     }
+// }, 10_000);

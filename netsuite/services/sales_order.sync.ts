@@ -4,7 +4,7 @@ import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync
 import log from "../config/logger.config";
 
 const PARALLEL_WORKERS = 5;
-const BATCH_LIMIT = 300;
+const BATCH_LIMIT = 500;
 
 export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     log.info(`[NS SO Sync] Starting — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
@@ -41,9 +41,13 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
         while (index < orders.length) {
             const i = index++;
             const order = orders[i];
+            const t0 = Date.now();
             const entry = await syncOneOrder(collection, order);
+            const elapsed = Date.now() - t0;
+            entry.ms = elapsed;
             results[i] = entry;
 
+            log.info(`[NS SO Sync] ${order.otherrefnum} took ${elapsed}ms`);
             if (entry.action === "no_items" || entry.action === "skipped") skipped++;
             else if (entry.success === false) errors++;
             else sent++;
@@ -54,7 +58,11 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
         Array.from({ length: Math.min(PARALLEL_WORKERS, orders.length) }, () => worker())
     );
 
-    log.info(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    const times = results.filter((r: any) => r?.ms).map((r: any) => r.ms);
+    const avg = times.length > 0 ? Math.round(times.reduce((a: number, b: number) => a + b, 0) / times.length) : 0;
+    const max = times.length > 0 ? Math.max(...times) : 0;
+    const min = times.length > 0 ? Math.min(...times) : 0;
+    log.info(`[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length} | timing: avg=${avg}ms, min=${min}ms, max=${max}ms`);
     return results;
 };
 
