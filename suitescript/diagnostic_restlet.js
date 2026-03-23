@@ -1177,15 +1177,16 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
             }
         }
 
-        // ── Fetch Items FAST (SuiteQL — bigger pages, faster pagination) ──────
-        // POST: { "sections": ["fetch_items_fast"], "page": 0, "pageSize": 2000 }
-        // Uses N/query SuiteQL for OFFSET/FETCH NEXT pagination (up to 5000/page).
+        // ── Fetch Items FAST (SuiteQL — keyset pagination by i.id) ──────────
+        // POST: { "sections": ["fetch_items_fast"], "lastId": 0, "pageSize": 4000 }
+        // Uses N/query SuiteQL with keyset pagination: WHERE i.id > lastId.
+        // No OFFSET — no OneWorld duplicate rows, no performance degradation.
         // BUILTIN.DF() gives text labels inline (no separate getText() calls).
         // Column resilience: if full query fails, drops bad columns and retries.
         // Same human-readable "description-internal_id" key format as fetch_all_items_full.
         if (sections.indexOf("fetch_items_fast") >= 0) {
-            var fiqPage = parseInt(payload.page, 10) || 0;
-            var fiqPageSize = parseInt(payload.pageSize, 10) || 2000;
+            var fiqLastId = parseInt(payload.lastId, 10) || 0;
+            var fiqPageSize = parseInt(payload.pageSize, 10) || 4000;
             if (fiqPageSize > 5000) fiqPageSize = 5000;
 
             try {
@@ -1390,30 +1391,25 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
                     fiqModFilter = " AND i.lastmodifieddate >= '" + payload.modifiedSince + "'";
                 }
 
-                // ── Get total count first ──
-                var fiqCountSql = "SELECT COUNT(*) AS cnt FROM item i WHERE i.isinactive = 'F'" + fiqModFilter;
-                var fiqCountResult = query.runSuiteQL({ query: fiqCountSql });
+                // ── Get total count on first call (lastId=0) for progress reporting ──
                 var fiqTotal = 0;
-                if (fiqCountResult && fiqCountResult.results && fiqCountResult.results.length > 0) {
-                    fiqTotal = parseInt(fiqCountResult.results[0].values[0], 10) || 0;
+                if (fiqLastId === 0) {
+                    var fiqCountSql = "SELECT COUNT(*) AS cnt FROM item i WHERE i.isinactive = 'F'" + fiqModFilter;
+                    var fiqCountResult = query.runSuiteQL({ query: fiqCountSql });
+                    if (fiqCountResult && fiqCountResult.results && fiqCountResult.results.length > 0) {
+                        fiqTotal = parseInt(fiqCountResult.results[0].values[0], 10) || 0;
+                    }
                 }
 
-                var fiqOffset = fiqPage * fiqPageSize;
-                if (fiqTotal === 0 || fiqOffset >= fiqTotal) {
-                    result.fetch_items_fast = {
-                        page: fiqPage, pageSize: fiqPageSize,
-                        total: fiqTotal, count: 0, items: [], done: true,
-                        fields: fiqKeys
-                    };
-                } else {
+                {
                     // ── Try full query — if it fails, drop bad columns and retry ──
                     var fiqActiveKeys = fiqKeys.slice();
                     var fiqActiveSelects = fiqSelectParts.slice();
                     var fiqSkipped = [];
                     var fiqItems = [];
 
-                    var fiqBaseSql = " FROM item i WHERE i.isinactive = 'F'" + fiqModFilter + " ORDER BY i.id";
-                    var fiqPageSql = " OFFSET " + fiqOffset + " ROWS FETCH NEXT " + fiqPageSize + " ROWS ONLY";
+                    var fiqBaseSql = " FROM item i WHERE i.isinactive = 'F' AND i.id > " + fiqLastId + fiqModFilter + " ORDER BY i.id";
+                    var fiqPageSql = " OFFSET 0 ROWS FETCH NEXT " + fiqPageSize + " ROWS ONLY";
 
                     // Attempt 1: full query
                     var fiqSuccess = false;
@@ -1477,10 +1473,45 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
                         fiqItems = mapSuiteQLResults(fiqRetryResult, fiqActiveKeys);
                     }
 
+                    // ── Enrich items with classification hierarchy ──
+                    // Fetches all classifications once, resolves every level's ID
+                    // via partial fullname lookup (e.g. "A : B : C" → "A", "A : B", "A : B : C")
+                    try {
+                        var classSql = "SELECT id, fullname FROM classification";
+                        var classResult = query.runSuiteQL({ query: classSql });
+                        var classNameToId = {};  // fullname → id
+                        var classIdToName = {};  // id → fullname
+                        if (classResult && classResult.results) {
+                            for (var cr = 0; cr < classResult.results.length; cr++) {
+                                var cv = classResult.results[cr].values;
+                                classNameToId[cv[1]] = cv[0];
+                                classIdToName[cv[0]] = cv[1];
+                            }
+                        }
+                        for (var ci3 = 0; ci3 < fiqItems.length; ci3++) {
+                            var itemClassId = fiqItems[ci3]["class"];
+                            if (itemClassId && classIdToName[itemClassId]) {
+                                var fn = classIdToName[itemClassId];
+                                var parts = fn.split(" : ");
+                                var levels = [];
+                                for (var p = 0; p < parts.length; p++) {
+                                    var partial = parts.slice(0, p + 1).join(" : ");
+                                    levels.push({ level: p + 1, name: parts[p], id: classNameToId[partial] || null });
+                                }
+                                fiqItems[ci3]["class_levels"] = levels;
+                            }
+                        }
+                    } catch (classErr) {
+                        log.audit("FIQ_CLASS", "Classification lookup failed: " + classErr.message);
+                    }
+
+                    var fiqResponseLastId = fiqItems.length > 0 ? fiqItems[fiqItems.length - 1]["internalid"] : null;
                     result.fetch_items_fast = {
-                        page: fiqPage, pageSize: fiqPageSize,
-                        total: fiqTotal, count: fiqItems.length, items: fiqItems,
-                        done: (fiqOffset + fiqItems.length) >= fiqTotal,
+                        lastId: fiqResponseLastId,
+                        pageSize: fiqPageSize,
+                        total: fiqTotal || undefined,
+                        count: fiqItems.length, items: fiqItems,
+                        done: fiqItems.length < fiqPageSize,
                         fields: fiqActiveKeys,
                         skippedFields: fiqSkipped.length > 0 ? fiqSkipped : undefined
                     };
