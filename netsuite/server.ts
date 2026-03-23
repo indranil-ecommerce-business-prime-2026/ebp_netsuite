@@ -69,7 +69,7 @@ app.listen(PORT, () => {
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
 let soSyncRunning = false;
 
-cron.schedule("*/20 * * * *", async () => {
+cron.schedule("*/15 * * * *", async () => {
     if (soSyncRunning) {
         log.warn("[CRON] [SO] Skipping — previous sync still running");
         return;
