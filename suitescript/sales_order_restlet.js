@@ -236,7 +236,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             // This triggers field change events so SuiteTax can process each line.
             var linesAdded = 0;
             var skippedSkus = [];
-            var SKIP_ITEM_TYPES = ["Group", "Kit", "Kit/Package"];
+            var SKIP_ITEM_TYPES = ["Group"];
 
             log.debug("ITEMS_INPUT", JSON.stringify({
                 count: Array.isArray(items) ? items.length : 0,

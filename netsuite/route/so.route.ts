@@ -232,4 +232,74 @@ router.post("/reset-so-sync", async (_req: any, res: any) => {
     }
 });
 
+// Reset only orders that failed with ns_result: "no_items"
+// GET  /reset-no-items  → dry-run (count only)
+// POST /reset-no-items  → actually reset
+router.get("/reset-no-items", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const count = await col.countDocuments({ ns_result: "no_items" });
+        res.json({ success: true, action: "dry_run", no_items_count: count });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+router.post("/reset-no-items", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const result = await col.updateMany(
+            { ns_result: "no_items" },
+            {
+                $unset: { ns_synced: "", ns_synced_at: "", ns_result: "" }
+            }
+        );
+        log.info(`[RESET-NO-ITEMS] Reset ${result.modifiedCount} orders`);
+        res.json({ success: true, action: "reset", matched: result.matchedCount, modified: result.modifiedCount });
+    } catch (e: any) {
+        log.error("[RESET-NO-ITEMS] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Re-stage Walmart orders with corrupt trandate (year > 2030 or ns_failed)
+// GET  /restage-walmart  → dry-run (count only)
+// POST /restage-walmart  → delete from suite_sales_order so staging re-inserts them
+router.get("/restage-walmart", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const failed = await col.countDocuments({ order_source: "walmart", ns_failed: true });
+        const corruptDate = await col.countDocuments({
+            order_source: "walmart",
+            trandate: { $gt: new Date("2030-01-01") }
+        });
+        const total = await col.countDocuments({ order_source: "walmart" });
+        res.json({ success: true, action: "dry_run", walmart_total: total, failed, corrupt_trandate: corruptDate });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+router.post("/restage-walmart", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const result = await col.deleteMany({
+            order_source: "walmart",
+            $or: [
+                { ns_failed: true },
+                { trandate: { $gt: new Date("2030-01-01") } }
+            ]
+        });
+        log.info(`[RESTAGE-WALMART] Deleted ${result.deletedCount} corrupt/failed Walmart orders for re-staging`);
+        res.json({ success: true, action: "deleted_for_restage", deleted: result.deletedCount });
+    } catch (e: any) {
+        log.error("[RESTAGE-WALMART] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 export default router;

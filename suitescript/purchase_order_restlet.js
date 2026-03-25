@@ -33,7 +33,7 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/record", "N/search", "N/log"], function (record, search, log) {
+define(["N/record", "N/search", "N/log", "N/query"], function (record, search, log, query) {
 
     // ── Caches ─────────────────────────────────────────────────────────────
     var _formCache = {};
@@ -642,6 +642,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         if (locationId) {
                             po.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId, ignoreFieldChange: false });
                         }
+                        po.setShippingAddressSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: stdItem.cost, ignoreFieldChange: false });
                         po.commitLine({ sublistId: "item" });
@@ -714,29 +715,28 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
     // ── Helper: find existing PO by otherrefnum ──────────────────────────────
     // Sorts by internalid DESC → picks newest if duplicates exist
     function findPurchaseOrder(otherrefnum) {
-        var idCol = search.createColumn({ name: "internalid", sort: search.Sort.DESC });
-        var tranCol = search.createColumn({ name: "tranid" });
+        var searchVal = String(otherrefnum);
+        var sql = "SELECT id, tranid, otherrefnum FROM transaction " +
+                  "WHERE type = 'PurchOrd' AND otherrefnum = ?";
 
-        var results = search.create({
-            type: search.Type.PURCHASE_ORDER,
-            filters: [
-                ["otherrefnum", "is", otherrefnum],
-                "AND",
-                ["mainline", "is", "T"]
-            ],
-            columns: [idCol, tranCol]
-        }).run().getRange({ start: 0, end: 10 });
+        log.debug("PO_LOOKUP", "SuiteQL search for otherrefnum='" + searchVal + "'");
 
-        if (results.length === 0) return null;
+        var rows = query.runSuiteQL({ query: sql, params: [searchVal] })
+                        .asMappedResults();
 
-        if (results.length > 1) {
-            log.audit("PO_DUPLICATES", "Found " + results.length +
-                " POs for otherrefnum " + otherrefnum + " -- using newest (highest ID)");
+        log.debug("PO_LOOKUP_RESULT", "otherrefnum='" + searchVal + "' → " + rows.length + " rows" +
+            (rows.length > 0 ? " | first: id=" + rows[0].id + " tranid=" + rows[0].tranid + " otherrefnum=" + rows[0].otherrefnum : ""));
+
+        if (rows.length === 0) return null;
+
+        if (rows.length > 1) {
+            log.audit("PO_DUPLICATES", "Found " + rows.length +
+                " POs for otherrefnum " + otherrefnum + " -- using first (id=" + rows[0].id + ")");
         }
 
         return {
-            id: parseInt(results[0].getValue(idCol), 10),
-            poNumber: results[0].getValue(tranCol)
+            id: parseInt(rows[0].id, 10),
+            poNumber: rows[0].tranid
         };
     }
 

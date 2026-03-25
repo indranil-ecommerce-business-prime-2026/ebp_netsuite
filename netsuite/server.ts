@@ -4,11 +4,8 @@ import cron from "node-cron";
 import log from "./config/logger.config";
 import { getDb } from "./config/mongdodb.config";
 import { retryFailedSalesOrders, syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
-// Used by commented-out cron jobs — uncomment when ready for production
-// import { stageSalesOrders } from "./services/sales_order.stage";
-// import { syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
-// import { stagePurchaseOrders } from "./services/po.stage";
-// import { syncPurchaseOrdersToNetsuite } from "./services/po.sync";
+import { stagePurchaseOrders } from "./services/po.stage";
+import { syncPurchaseOrdersToNetsuite } from "./services/po.sync";
 import { runItemFullSync } from "./controller/netsuite_item_full";
 
 // Route modules
@@ -16,6 +13,7 @@ import soRoutes from "./route/so.route";
 import poRoutes from "./route/po.route";
 import diagnosticRoutes from "./route/diagnostic.route";
 import itemRoutes from "./route/item.route";
+import indexRoutes from "./route/index.route";
 import { stageSalesOrders } from "./services/sales_order.stage";
 
 dotenv.config();
@@ -27,6 +25,7 @@ app.use(soRoutes);
 app.use(poRoutes);
 app.use(diagnosticRoutes);
 app.use(itemRoutes);
+app.use(indexRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SERVER
@@ -69,33 +68,46 @@ app.listen(PORT, () => {
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
 let soSyncRunning = false;
 
-cron.schedule("*/15 * * * *", async () => {
-    if (soSyncRunning) {
-        log.warn("[CRON] [SO] Skipping — previous sync still running");
+// cron.schedule("*/15 * * * *", async () => {
+//     if (soSyncRunning) {
+//         log.warn("[CRON] [SO] Skipping — previous sync still running");
+//         return;
+//     }
+//     soSyncRunning = true;
+//     try {
+//         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+//         await stageSalesOrders();
+
+//         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+//         await syncSalesOrdersToNetsuite();
+//     } catch (err: any) {
+//         log.error("[CRON] [SO] Error", { error: err.message });
+//     } finally {
+//         soSyncRunning = false;
+//     }
+// });
+
+// ─── Every 20 mins — Purchase Orders (staging + sync) ────────────────────────
+let poSyncRunning = false;
+
+cron.schedule("*/20 * * * *", async () => {
+    if (poSyncRunning) {
+        log.warn("[CRON] [PO] Skipping — previous sync still running");
         return;
     }
-    soSyncRunning = true;
+    poSyncRunning = true;
     try {
-        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-        await stageSalesOrders();
+        log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
+        await stagePurchaseOrders();
 
-        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-        await syncSalesOrdersToNetsuite();
+        log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+        await syncPurchaseOrdersToNetsuite();
     } catch (err: any) {
-        log.error("[CRON] [SO] Error", { error: err.message });
+        log.error("[CRON] [PO] Error", { error: err.message });
     } finally {
-        soSyncRunning = false;
+        poSyncRunning = false;
     }
 });
-
-// ─── Every 30 mins — Purchase Orders (shipped or invoiced) ──────────────────
-// cron.schedule("*/30 * * * *", async () => {
-//     log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-//     await stagePurchaseOrders();
-//
-//     log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-//     await syncPurchaseOrdersToNetsuite();
-// });
 
 // ─── Daily 3 AM — Auto-retry permanently failed SOs ─────────────────────────
 // cron.schedule("0 3 * * *", async () => {

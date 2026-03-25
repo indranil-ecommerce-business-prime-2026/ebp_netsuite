@@ -150,7 +150,7 @@ function buildWalmartOrders(
 
         // orderDate can be "0000-00-00 00:00:00" — fall back to createdAt
         let trandate = order.orderDate ? new Date(order.orderDate) : null;
-        if (!trandate || isNaN(trandate.getTime()) || trandate.getFullYear() < 2000) {
+        if (!trandate || isNaN(trandate.getTime()) || trandate.getFullYear() < 2000 || trandate.getFullYear() > 2030) {
             trandate = order.createdAt ? new Date(order.createdAt) : new Date();
         }
 
@@ -287,7 +287,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         getDb("netsuite"),
         getDb("ebp_pomanager"),
         getDb("new_eggs"),
-        getDb("walmart"),
+        getDb("walmarts"),
     ]);
 
     // ── Fetch all data sources concurrently ─────────────────────────────────
@@ -302,7 +302,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         tpx_db.collection("tpx_orders").find(
             {
                 store_type: { $nin: ["shopify", "ebay"] },
-                $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }]
+                $or: [{ created_at: { $gt: new Date(DATE_FILTER) } }, { created_at: null }]
             },
             { projection: { txn_id: 1, store_type: 1 } }
         ).toArray(),
@@ -319,7 +319,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
 
         // 5. Newegg BB orders
         newegg_db.collection("newegg_bb_orders_v2").find({
-            OrderDate: { $gt: DATE_FILTER }
+            OrderDate: { $gt: new Date(DATE_FILTER) }
         }).toArray(),
 
         // 6. Walmart orders
@@ -330,7 +330,7 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         // 7. TPX orders for Shopify/eBay (full documents, not just store_type lookup)
         tpx_db.collection("tpx_orders").find({
             store_type: { $in: ["shopify", "ebay"] },
-            $or: [{ created_at: { $gt: DATE_FILTER_SQL } }, { created_at: null }]
+            $or: [{ created_at: { $gt: new Date(DATE_FILTER) } }, { created_at: null }]
         }).toArray(),
     ]);
 

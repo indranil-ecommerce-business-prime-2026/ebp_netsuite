@@ -1,8 +1,63 @@
 import { Router } from "express";
 import log from "../config/logger.config";
+import { getDb } from "../config/mongdodb.config";
 import { callDiagnostic, callCleanup, postToNetsuiteForBill } from "../services/netsuite.client";
 
 const router = Router();
+
+// ─── Sync Classification Tree (NetSuite → MongoDB) ─────────────────────────
+// GET /sync-class-tree → fetches all classes from NetSuite, builds nested tree, stores in MongoDB
+router.get("/sync-class-tree", async (_req: any, res: any) => {
+    try {
+        log.info("[CLASS-TREE] Fetching classifications from NetSuite...");
+        const response = await callDiagnostic({ sections: ["fetch_class_tree"] });
+        const data = response?.fetch_class_tree;
+
+        if (!data || data.error) {
+            return res.status(500).json({ success: false, error: data?.error || "No data returned" });
+        }
+
+        const flat: any[] = data.classifications || [];
+        log.info(`[CLASS-TREE] Got ${flat.length} classifications. Building tree...`);
+
+        // Build nested tree from flat list
+        const nodeMap: Record<string, any> = {};
+        for (const c of flat) {
+            nodeMap[c.id] = { internalid: c.id, name: c.name, fullname: c.fullname, children: [] };
+        }
+
+        const roots: any[] = [];
+        for (const c of flat) {
+            if (c.parent && nodeMap[c.parent]) {
+                nodeMap[c.parent].children.push(nodeMap[c.id]);
+            } else if (!c.parent) {
+                roots.push(nodeMap[c.id]);
+            }
+        }
+
+        // Store each root as a separate document in MongoDB
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("netsuite_classifications");
+
+        // Clean and replace
+        await col.deleteMany({});
+        if (roots.length > 0) {
+            await col.insertMany(roots);
+        }
+        await col.createIndex({ internalid: 1 }, { unique: true });
+
+        log.info(`[CLASS-TREE] Done. ${roots.length} root classes stored with nested children.`);
+        res.json({
+            success: true,
+            total_classifications: flat.length,
+            root_classes: roots.length,
+            tree: roots,
+        });
+    } catch (e: any) {
+        log.error("[CLASS-TREE] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
 
 // ─── Diagnostic ─────────────────────────────────────────────────────────────
 router.get("/diagnostic", async (_req: any, res: any) => {

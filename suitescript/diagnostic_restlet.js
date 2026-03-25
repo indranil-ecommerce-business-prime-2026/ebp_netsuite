@@ -38,7 +38,7 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (search, record, runtime, log, query) {
+define(["N/search", "N/record", "N/runtime", "N/log", "N/query", "N/task", "N/file"], function (search, record, runtime, log, query, task, file) {
 
     function post(payload) {
         log.debug("DIAGNOSTIC_ENTRY", "Payload received: " + JSON.stringify(payload));
@@ -1521,6 +1521,27 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
             }
         }
 
+        // ── Fetch Classification Tree (all classes with parent/child) ──────
+        // POST: { "sections": ["fetch_class_tree"] }
+        // Returns flat list of all active classifications with id, name, fullname, parent.
+        // Controller builds the nested tree on Node side.
+        if (sections.indexOf("fetch_class_tree") >= 0) {
+            try {
+                var ctSql = "SELECT id, name, fullname, parent FROM classification WHERE isinactive = 'F' ORDER BY fullname";
+                var ctResult = query.runSuiteQL({ query: ctSql });
+                var ctItems = [];
+                if (ctResult && ctResult.results) {
+                    for (var cti = 0; cti < ctResult.results.length; cti++) {
+                        var ctv = ctResult.results[cti].values;
+                        ctItems.push({ id: ctv[0], name: ctv[1], fullname: ctv[2], parent: ctv[3] });
+                    }
+                }
+                result.fetch_class_tree = { count: ctItems.length, classifications: ctItems };
+            } catch (e) {
+                result.fetch_class_tree = { error: e.message };
+            }
+        }
+
         // ── Custom Item Field Map (field ID → label) ──────────────────────
         // POST: { "sections": ["item_field_map"] }
         // POST: { "sections": ["item_field_map"], "itemId": 12692 }
@@ -1993,6 +2014,267 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query"], function (sear
             } catch (e) {
                 log.error("CLEANUP_ALL_PO_ERROR", e.name + ": " + e.message);
                 result.cleanup_all_po = { error: e.message };
+            }
+        }
+
+        // ── Update Item Classes (submitFields — 10 units each) ────────────
+        // POST: { "sections": ["update_item_classes"], "items": [{ "id": 123, "type": "InvtPart", "classId": 456 }, ...] }
+        // type values: "InvtPart", "SerializedInventoryItem", "NonInvtPart", "Assembly", "Kit"
+        // Max 400 items per call (400 × 10 = 4,000 governance units)
+        if (sections.indexOf("update_item_classes") >= 0) {
+            var ucItems = payload.items || [];
+            log.debug("UC_START", "Received " + ucItems.length + " items for class update");
+            if (ucItems.length > 400) ucItems = ucItems.slice(0, 400);
+
+            // Log first 3 items for debugging
+            for (var ucDbg = 0; ucDbg < Math.min(3, ucItems.length); ucDbg++) {
+                log.debug("UC_SAMPLE_" + ucDbg, JSON.stringify(ucItems[ucDbg]));
+            }
+
+            var ucTypeMap = {
+                "InvtPart":                    record.Type.INVENTORY_ITEM,
+                "inventoryitem":               record.Type.INVENTORY_ITEM,
+                "SerializedInventoryItem":     record.Type.SERIALIZED_INVENTORY_ITEM,
+                "serializedinventoryitem":     record.Type.SERIALIZED_INVENTORY_ITEM,
+                "NonInvtPart":                 record.Type.NON_INVENTORY_ITEM,
+                "noninventoryitem":            record.Type.NON_INVENTORY_ITEM,
+                "Assembly":                    record.Type.ASSEMBLY_ITEM,
+                "assemblyitem":                record.Type.ASSEMBLY_ITEM,
+                "Kit":                         record.Type.KIT_ITEM,
+                "kititem":                     record.Type.KIT_ITEM
+            };
+
+            var ucScript = runtime.getCurrentScript();
+            var ucStartUsage = ucScript.getRemainingUsage();
+            log.debug("UC_GOVERNANCE", "Starting governance units: " + ucStartUsage);
+
+            var ucUpdated = 0;
+            var ucFailed = 0;
+            var ucStopped = 0;
+            var ucSkippedInvalid = 0;
+            var ucSkippedNoType = 0;
+            var ucFailedDetails = [];
+            var ucTypeCounts = {};  // track which record types are being used
+
+            for (var uci = 0; uci < ucItems.length; uci++) {
+                // Governance guard: stop if < 100 units remaining
+                var ucRemaining = ucScript.getRemainingUsage();
+                if (ucRemaining < 100) {
+                    ucStopped = ucItems.length - uci;
+                    log.audit("UC_GOV_STOP", "Stopping at item " + uci + "/" + ucItems.length + " — only " + ucRemaining + " units left. Updated: " + ucUpdated + ", Failed: " + ucFailed);
+                    break;
+                }
+
+                // Log progress every 50 items
+                if (uci > 0 && uci % 50 === 0) {
+                    log.debug("UC_PROGRESS", "Item " + uci + "/" + ucItems.length + " — updated: " + ucUpdated + ", failed: " + ucFailed + ", units left: " + ucRemaining);
+                }
+
+                var ucEntry = ucItems[uci];
+                var ucId = Number(ucEntry.id);
+                var ucClassId = Number(ucEntry.classId);
+                var ucRecType = ucTypeMap[ucEntry.type];
+
+                if (!ucId || isNaN(ucId) || !ucClassId || isNaN(ucClassId)) {
+                    ucSkippedInvalid++;
+                    ucFailed++;
+                    ucFailedDetails.push({ id: ucEntry.id, classId: ucEntry.classId, error: "invalid id=" + ucEntry.id + " or classId=" + ucEntry.classId });
+                    if (ucSkippedInvalid <= 5) {
+                        log.debug("UC_INVALID", "Skipping invalid: id=" + ucEntry.id + " classId=" + ucEntry.classId + " type=" + ucEntry.type);
+                    }
+                    continue;
+                }
+
+                if (!ucRecType) {
+                    ucSkippedNoType++;
+                    ucRecType = record.Type.INVENTORY_ITEM;
+                    if (ucSkippedNoType <= 5) {
+                        log.debug("UC_NO_TYPE", "Unknown type '" + ucEntry.type + "' for id=" + ucId + " — defaulting to INVENTORY_ITEM");
+                    }
+                }
+
+                // Track type distribution
+                var ucTypeKey = ucEntry.type || "null";
+                ucTypeCounts[ucTypeKey] = (ucTypeCounts[ucTypeKey] || 0) + 1;
+
+                try {
+                    record.submitFields({
+                        type: ucRecType,
+                        id: ucId,
+                        values: { "class": ucClassId },
+                        options: { enableSourcing: false, ignoreMandatoryFields: true }
+                    });
+                    ucUpdated++;
+                } catch (ucErr) {
+                    // Auto-retry with correct type if mismatch (e.g. InvtPart → SerializedInventoryItem)
+                    var ucRetryType = null;
+                    var errMsg = ucErr.message || "";
+                    if (errMsg.indexOf("different type:") >= 0) {
+                        // Extract actual type from: "different type: serializedinventoryitem from the type specified"
+                        var typeMatch = errMsg.match(/different type:\s*(\w+)\s*from/);
+                        if (typeMatch && typeMatch[1]) {
+                            ucRetryType = ucTypeMap[typeMatch[1]] || null;
+                        }
+                    }
+
+                    if (ucRetryType && ucRetryType !== ucRecType) {
+                        try {
+                            record.submitFields({
+                                type: ucRetryType,
+                                id: ucId,
+                                values: { "class": ucClassId },
+                                options: { enableSourcing: false, ignoreMandatoryFields: true }
+                            });
+                            ucUpdated++;
+                            // Track retried type
+                            var retryKey = ucEntry.type + "→" + typeMatch[1];
+                            ucTypeCounts[retryKey] = (ucTypeCounts[retryKey] || 0) + 1;
+                        } catch (ucRetryErr) {
+                            ucFailed++;
+                            ucFailedDetails.push({ id: ucId, classId: ucClassId, type: ucEntry.type, retried: typeMatch[1], error: ucRetryErr.message });
+                            if (ucFailed <= 10) {
+                                log.error("UC_FAIL", "id=" + ucId + " retry as " + typeMatch[1] + " classId=" + ucClassId + " — " + ucRetryErr.message);
+                            }
+                        }
+                    } else {
+                        ucFailed++;
+                        ucFailedDetails.push({ id: ucId, classId: ucClassId, type: ucEntry.type, nsType: String(ucRecType), error: errMsg });
+                        if (ucFailed <= 10) {
+                            log.error("UC_FAIL", "id=" + ucId + " type=" + ucEntry.type + " nsType=" + ucRecType + " classId=" + ucClassId + " — " + errMsg);
+                        }
+                    }
+                }
+            }
+
+            var ucEndUsage = ucScript.getRemainingUsage();
+            log.audit("UC_DONE", "Updated: " + ucUpdated + ", Failed: " + ucFailed + ", Stopped: " + ucStopped + ", InvalidIds: " + ucSkippedInvalid + ", NoType: " + ucSkippedNoType + ", Governance used: " + (ucStartUsage - ucEndUsage) + ", Remaining: " + ucEndUsage);
+            log.debug("UC_TYPES", "Type distribution: " + JSON.stringify(ucTypeCounts));
+
+            result.update_item_classes = {
+                requested: ucItems.length,
+                updated: ucUpdated,
+                failed: ucFailed,
+                stopped: ucStopped,
+                skippedInvalid: ucSkippedInvalid,
+                skippedNoType: ucSkippedNoType,
+                governanceUsed: ucStartUsage - ucEndUsage,
+                governanceRemaining: ucEndUsage,
+                typeCounts: ucTypeCounts,
+                details: ucFailedDetails
+            };
+        }
+
+        // ── Trigger Item Class Update MapReduce ─────────────────────────────
+        // POST: { "sections": ["trigger_class_mr"], "items": [{ "id": 123, "type": "InvtPart", "classId": 456 }, ...] }
+        // Writes items to File Cabinet as JSON, triggers MapReduceScript.
+        // Returns taskId for status polling via check_mr_status.
+        if (sections.indexOf("trigger_class_mr") >= 0) {
+            var mrItems = payload.items || [];
+            if (mrItems.length === 0) {
+                result.trigger_class_mr = { error: "No items provided" };
+            } else {
+                try {
+                    // Write JSON file to File Cabinet (SuiteScripts folder)
+                    var mrFileName = "class_update_" + new Date().getTime() + ".json";
+                    var mrFile = file.create({
+                        name: mrFileName,
+                        fileType: file.Type.JSON,
+                        contents: JSON.stringify(mrItems),
+                        folder: -15  // SuiteScripts folder
+                    });
+                    var mrFileId = mrFile.save();
+                    log.audit("TRIGGER_CLASS_MR", "Wrote " + mrItems.length + " items to file " + mrFileId + " (" + mrFileName + ")");
+
+                    // Trigger MapReduceScript
+                    var mrTask = task.create({
+                        taskType: task.TaskType.MAP_REDUCE,
+                        scriptId: "customscript_update_item_classes_mr",
+                        deploymentId: "customdeploy_update_item_classes_mr",
+                        params: { "custscript_custscript_uc_file_id": mrFileId }
+                    });
+                    var mrTaskId = mrTask.submit();
+                    log.audit("TRIGGER_CLASS_MR", "Submitted MR task " + mrTaskId);
+
+                    result.trigger_class_mr = {
+                        success: true,
+                        taskId: mrTaskId,
+                        fileId: mrFileId,
+                        fileName: mrFileName,
+                        itemCount: mrItems.length
+                    };
+                } catch (mrErr) {
+                    log.error("TRIGGER_CLASS_MR", mrErr.message);
+                    result.trigger_class_mr = { error: mrErr.message };
+                }
+            }
+        }
+
+        // ── Check MapReduce Task Status ──────────────────────────────────────
+        // POST: { "sections": ["check_mr_status"], "taskId": "MAPREDUCETASK_xxx" }
+        if (sections.indexOf("check_mr_status") >= 0) {
+            var checkTaskId = payload.taskId || "";
+            if (!checkTaskId) {
+                result.check_mr_status = { error: "Missing taskId" };
+            } else {
+                try {
+                    var mrStatus = task.checkStatus({ taskId: checkTaskId });
+                    result.check_mr_status = {
+                        taskId: checkTaskId,
+                        status: mrStatus.status,
+                        stage: mrStatus.stage || null,
+                        percentComplete: mrStatus.getPercentageCompleted ? mrStatus.getPercentageCompleted() : null
+                    };
+                } catch (statusErr) {
+                    result.check_mr_status = { taskId: checkTaskId, error: statusErr.message };
+                }
+            }
+        }
+
+        // ── Trigger Generalized Item Field Update MapReduce ──────────────────
+        // POST: { "sections": ["trigger_fields_mr"], "items": [{ "id": 123, "type": "InvtPart", "values": { "displayname": "...", "class": 499, "isdropshipitem": false } }, ...] }
+        // Writes items to File Cabinet as JSON, triggers the same MR script with generic values.
+        // Returns taskId for status polling via check_mr_status.
+        if (sections.indexOf("trigger_fields_mr") >= 0) {
+            var ufItems = payload.items || [];
+            if (ufItems.length === 0) {
+                result.trigger_fields_mr = { error: "No items provided" };
+            } else {
+                try {
+                    var ufFileName = "field_update_" + new Date().getTime() + ".json";
+                    var ufFile = file.create({
+                        name: ufFileName,
+                        fileType: file.Type.JSON,
+                        contents: JSON.stringify(ufItems),
+                        folder: -15  // SuiteScripts folder
+                    });
+                    var ufFileId = ufFile.save();
+
+                    // Log field summary
+                    var ufSample = ufItems[0];
+                    var ufFields = ufSample.values ? Object.keys(ufSample.values).join(", ") : "legacy";
+                    log.audit("TRIGGER_FIELDS_MR", "Wrote " + ufItems.length + " items to file " + ufFileId + " (" + ufFileName + ") — fields: " + ufFields);
+
+                    var ufTask = task.create({
+                        taskType: task.TaskType.MAP_REDUCE,
+                        scriptId: "customscript_update_item_classes_mr",
+                        deploymentId: "customdeploy_update_item_classes_mr",
+                        params: { "custscript_custscript_uc_file_id": ufFileId }
+                    });
+                    var ufTaskId = ufTask.submit();
+                    log.audit("TRIGGER_FIELDS_MR", "Submitted MR task " + ufTaskId);
+
+                    result.trigger_fields_mr = {
+                        success: true,
+                        taskId: ufTaskId,
+                        fileId: ufFileId,
+                        fileName: ufFileName,
+                        itemCount: ufItems.length,
+                        fields: ufFields
+                    };
+                } catch (ufErr) {
+                    log.error("TRIGGER_FIELDS_MR", ufErr.message);
+                    result.trigger_fields_mr = { error: ufErr.message };
+                }
             }
         }
 
