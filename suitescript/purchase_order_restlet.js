@@ -642,7 +642,7 @@ define(["N/record", "N/search", "N/log", "N/query"], function (record, search, l
                         if (locationId) {
                             po.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId, ignoreFieldChange: false });
                         }
-                        po.setShippingAddressSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
+                        po.setShipping_Address_SublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: stdItem.cost, ignoreFieldChange: false });
                         po.commitLine({ sublistId: "item" });
