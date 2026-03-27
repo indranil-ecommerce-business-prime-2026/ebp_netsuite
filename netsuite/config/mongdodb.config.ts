@@ -8,7 +8,7 @@ export async function connectMongoBase(): Promise<Connection> {
   const user = encodeURIComponent(process.env.mUser || "");
   const pass = encodeURIComponent(process.env.pUser || "");
   const host = "64.225.124.70";
-  const port = "27017";
+  const port = "27018";
   const uri = `mongodb://${user}:${pass}@${host}:${port}/?authSource=admin`;
 
   const m = await mongoose.connect(uri);
