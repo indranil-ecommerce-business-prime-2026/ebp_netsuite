@@ -53,7 +53,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         var snap = { header: {}, lines: [] };
         var headerFields = [
             "customform", "entity", "subsidiary", "otherrefnum",
-            "trandate", "memo", "currency", "custbody1", "custbody2",
+            "trandate", "currency", "custbody1", "custbody2",
             "custbody_otherrefnumber_custom"
         ];
         for (var hi = 0; hi < headerFields.length; hi++) {
@@ -181,6 +181,60 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         return null;
     }
 
+    // ── Copy SO shipping address → PO (Dropship: ship to customer) ─────
+    function copySOShippingToPO(soId, po) {
+        try {
+            var so = record.load({ type: record.Type.SALES_ORDER, id: soId, isDynamic: false });
+            var soShip = so.getSubrecord({ fieldId: "shippingaddress" });
+
+            var addrFields = {
+                country:   soShip.getValue({ fieldId: "country" }) || "US",
+                addressee: soShip.getValue({ fieldId: "addressee" }) || "",
+                attention: soShip.getValue({ fieldId: "attention" }) || "",
+                addr1:     soShip.getValue({ fieldId: "addr1" }) || "",
+                addr2:     soShip.getValue({ fieldId: "addr2" }) || "",
+                city:      soShip.getValue({ fieldId: "city" }) || "",
+                state:     soShip.getValue({ fieldId: "state" }) || "",
+                zip:       soShip.getValue({ fieldId: "zip" }) || "",
+                addrphone: soShip.getValue({ fieldId: "addrphone" }) || ""
+            };
+
+            log.debug("SO_SHIP_ADDR", JSON.stringify(addrFields));
+
+            // Clear predefined list → enables custom address entry
+            po.setValue({ fieldId: "shipaddresslist", value: "" });
+
+            var poShip = po.getSubrecord({ fieldId: "shippingaddress" });
+            poShip.setValue({ fieldId: "country",   value: addrFields.country });
+            poShip.setValue({ fieldId: "addressee", value: addrFields.addressee });
+            if (addrFields.attention) poShip.setValue({ fieldId: "attention", value: addrFields.attention });
+            poShip.setValue({ fieldId: "addr1", value: addrFields.addr1 });
+            if (addrFields.addr2) poShip.setValue({ fieldId: "addr2", value: addrFields.addr2 });
+            poShip.setValue({ fieldId: "city",  value: addrFields.city });
+            poShip.setValue({ fieldId: "state", value: addrFields.state });
+            poShip.setValue({ fieldId: "zip",   value: addrFields.zip });
+            if (addrFields.addrphone) poShip.setValue({ fieldId: "addrphone", value: addrFields.addrphone });
+
+            log.debug("PO_SHIP_ADDR_SET", "Copied SO " + soId + " shipping address to PO");
+            return { success: true, address: addrFields };
+        } catch (e) {
+            log.error("COPY_SHIP_ADDR_ERR", "SO " + soId + ": " + e.message);
+            return { success: false, error: e.message };
+        }
+    }
+
+    // ── Set PO ship-to = warehouse location (Stocking) ──────────────────
+    function setStockingShipAddress(po, locationId) {
+        try {
+            po.setValue({ fieldId: "shipaddresslist", value: parseInt(locationId, 10) });
+            log.debug("STOCKING_SHIP_ADDR", "Set shipaddresslist to location " + locationId);
+            return { success: true, locationId: locationId };
+        } catch (e) {
+            log.debug("STOCKING_SHIP_ADDR_ERR", e.message);
+            return { success: false, error: e.message };
+        }
+    }
+
     // ── Update SO for Dropship — location + qty/amount sync ─────────────
     // Sets location=Dropship AND updates qty/amount on matching lines.
     // This MUST run BEFORE record.create with defaultValues.soid so the PO
@@ -282,9 +336,11 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
     // ── Set PO header fields ────────────────────────────────────────────
     function setPOHeaders(po, opts) {
+        try { po.setValue({ fieldId: "tranid", value: "PO" + String(opts.po_number) }); } catch (e) {
+            log.debug("TRANID_SKIP", "Could not set tranid: " + e.message);
+        }
         po.setValue({ fieldId: "otherrefnum", value: String(opts.po_number) });
         po.setValue({ fieldId: "trandate",    value: new Date() });
-        po.setValue({ fieldId: "memo",        value: opts.website_order_number });
 
         try { po.setValue({ fieldId: "custbody2", value: String(opts.distributor_order_number || opts.po_number) }); } catch (e) {
             log.debug("FIELD_SKIP", "custbody2: " + e.message);
@@ -296,13 +352,6 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             try { po.setValue({ fieldId: "custbody_otherrefnumber_custom", value: String(opts.distributor) }); } catch (e) {
                 log.debug("FIELD_SKIP", "custbody_otherrefnumber_custom: " + e.message);
             }
-        }
-        if (Array.isArray(opts.invoice) && opts.invoice.length > 0) {
-            var invRef = opts.invoice[0];
-            if (typeof invRef === "object" && invRef !== null) {
-                invRef = invRef.invoiceNumber || invRef.invoice_number || JSON.stringify(invRef);
-            }
-            po.setValue({ fieldId: "memo", value: opts.website_order_number + " | INV: " + invRef });
         }
     }
 
@@ -757,6 +806,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: newItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: newItem.cost, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: newItem.qty * newItem.cost, ignoreFieldChange: false });
+                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) {}
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                     } catch (addErr) {
@@ -814,6 +864,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         }
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: stdItem.cost, ignoreFieldChange: false });
+                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) {}
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                         log.debug("ITEM_ADDED", "SKU \"" + stdItem.sku + "\" → lines now: " + po.getLineCount({ sublistId: "item" }));
@@ -847,11 +898,23 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 };
             }
 
+            // ── Set shipping address ─────────────────────────────────────────
+            var shipResult = null;
+            if (po_type === "Dropship" && linkedSoId) {
+                shipResult = copySOShippingToPO(linkedSoId, po);
+            } else if (po_type === "Stocking" && locationId) {
+                shipResult = setStockingShipAddress(po, locationId);
+            }
+            if (shipResult) log.debug("SHIP_ADDRESS", JSON.stringify(shipResult));
+
+            // ── Clear auto-sourced class to avoid subsidiary mismatch ────────
+            try { po.setValue({ fieldId: "class", value: "" }); } catch (e) {}
+
             // ── SNAPSHOT: AFTER (before save) ────────────────────────────────
             after = snapshotPO(po);
             diff = diffSnapshots(before, after);
 
-            var savedId = po.save({ enableSourcing: true, ignoreMandatoryFields: true });
+            var savedId = po.save({ enableSourcing: false, ignoreMandatoryFields: true });
             log.debug("SUCCESS", "PO " + po_number + " saved → ID: " + savedId);
 
             // Verify createdfrom link via search (same pattern as support script)
