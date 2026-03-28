@@ -33,7 +33,7 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/record", "N/search", "N/log"], function (record, search, log) {
+define(["N/record", "N/search", "N/query", "N/log"], function (record, search, query, log) {
 
     // ── Caches ─────────────────────────────────────────────────────────────
     var _formCache = {};
@@ -973,29 +973,21 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
     // ── Helper: find existing PO by otherrefnum ──────────────────────────────
     // Sorts by internalid DESC → picks newest if duplicates exist
     function findPurchaseOrder(otherrefnum) {
-        var idCol = search.createColumn({ name: "internalid", sort: search.Sort.DESC });
-        var tranCol = search.createColumn({ name: "tranid" });
+        // SuiteQL for exact match — N/search on otherrefnum returns false positives (gotcha #12)
+        var sql = "SELECT id, tranid FROM transaction WHERE type = 'PurchOrd' AND otherrefnum = ? ORDER BY id DESC";
+        var resultSet = query.runSuiteQL({ query: sql, params: [String(otherrefnum)] });
+        var rows = resultSet.asMappedResults();
 
-        var results = search.create({
-            type: search.Type.PURCHASE_ORDER,
-            filters: [
-                ["otherrefnum", "is", otherrefnum],
-                "AND",
-                ["mainline", "is", "T"]
-            ],
-            columns: [idCol, tranCol]
-        }).run().getRange({ start: 0, end: 10 });
+        if (rows.length === 0) return null;
 
-        if (results.length === 0) return null;
-
-        if (results.length > 1) {
-            log.audit("PO_DUPLICATES", "Found " + results.length +
+        if (rows.length > 1) {
+            log.audit("PO_DUPLICATES", "Found " + rows.length +
                 " POs for otherrefnum " + otherrefnum + " -- using newest (highest ID)");
         }
 
         return {
-            id: parseInt(results[0].getValue(idCol), 10),
-            poNumber: results[0].getValue(tranCol)
+            id: parseInt(rows[0].id, 10),
+            poNumber: rows[0].tranid
         };
     }
 
