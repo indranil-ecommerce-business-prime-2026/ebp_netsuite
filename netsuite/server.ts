@@ -69,24 +69,24 @@ app.listen(PORT, () => {
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
 let soSyncRunning = false;
 
-// cron.schedule("*/15 * * * *", async () => {
-//     if (soSyncRunning) {
-//         log.warn("[CRON] [SO] Skipping — previous sync still running");
-//         return;
-//     }
-//     soSyncRunning = true;
-//     try {
-//         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-//         await stageSalesOrders();
+cron.schedule("*/15 * * * *", async () => {
+    if (soSyncRunning) {
+        log.warn("[CRON] [SO] Skipping — previous sync still running");
+        return;
+    }
+    soSyncRunning = true;
+    try {
+        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+        await stageSalesOrders();
 
-//         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-//         await syncSalesOrdersToNetsuite();
-//     } catch (err: any) {
-//         log.error("[CRON] [SO] Error", { error: err.message });
-//     } finally {
-//         soSyncRunning = false;
-//     }
-// });
+        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+        await syncSalesOrdersToNetsuite();
+    } catch (err: any) {
+        log.error("[CRON] [SO] Error", { error: err.message });
+    } finally {
+        soSyncRunning = false;
+    }
+});
 
 // ─── PO sync offset from SO to avoid overlap ─────────────────────────────────
 // SO runs at :00, :15, :30, :45  →  PO runs at :07, :22, :37, :52

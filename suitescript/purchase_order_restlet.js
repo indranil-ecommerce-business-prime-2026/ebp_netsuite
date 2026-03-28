@@ -340,7 +340,10 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             log.debug("TRANID_SKIP", "Could not set tranid: " + e.message);
         }
         po.setValue({ fieldId: "otherrefnum", value: String(opts.po_number) });
-        po.setValue({ fieldId: "trandate",    value: new Date() });
+        // Use PO created_at date if provided (ISO string from server), otherwise today
+        var poDate = opts.created_at ? new Date(opts.created_at) : new Date();
+        if (isNaN(poDate.getTime())) poDate = new Date();
+        po.setValue({ fieldId: "trandate",    value: poDate });
 
         try { po.setValue({ fieldId: "custbody2", value: String(opts.distributor_order_number || opts.po_number) }); } catch (e) {
             log.debug("FIELD_SKIP", "custbody2: " + e.message);
@@ -404,6 +407,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             var order_items              = payload.order_items;
             var po_type                  = payload.po_type || "";
             var stocking_warehouse       = payload.stocking_warehouse || "";
+            var created_at               = payload.created_at || "";
 
             if (!po_number) {
                 return { success: false, error: "Missing po_number" };
@@ -515,7 +519,8 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                 distributor_order_number: distributor_order_number,
                 status: status,
                 distributor: distributor,
-                invoice: invoice
+                invoice: invoice,
+                created_at: created_at
             };
 
             if (po_type === "Dropship" && linkedSoId) {

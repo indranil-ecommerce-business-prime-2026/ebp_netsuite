@@ -14,6 +14,16 @@ const PARALLEL_WORKERS = 5;
 const STOCKING_BATCH = 50;
 const DROPSHIP_BATCH = 20;   // lower — each dropship PO touches SO too
 
+// Parse created_at safely — sends "M/D/YYYY" to avoid UTC→timezone date shift.
+// NetSuite trandate only needs a date, not a time.
+function toSafeISO(raw: any): string {
+    if (!raw) return "";
+    const d = new Date(String(raw).replace(" ", "T"));
+    if (isNaN(d.getTime()) || d.getFullYear() < 2000 || d.getFullYear() > 2030) return "";
+    // Extract local date parts to avoid timezone offset shifting the day
+    return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+}
+
 export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
     log.info(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
 
@@ -113,7 +123,8 @@ async function syncOnePO(collection: any, po: any): Promise<any> {
             order_items:              po.order_items,
             website_order_number:     po.website_order_number,
             po_type:                  po.po_type || "",
-            stocking_warehouse:       po.stocking_warehouse || ""
+            stocking_warehouse:       po.stocking_warehouse || "",
+            created_at:               toSafeISO(po.created_at)
         }), `PO ${po.po_number}`);
 
         const ms = Date.now() - t0;
