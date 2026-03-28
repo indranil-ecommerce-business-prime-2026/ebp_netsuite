@@ -15,8 +15,11 @@ jobs:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 2222 
           script: |
             cd /ebpconsole/ebp_netsuite
-            git pull origin main
+            git stash
+            git pull origin
+            # git reset --hard origin/main
             npm install
             pm2 reload vg_netsuite
