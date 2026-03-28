@@ -5,11 +5,11 @@ let baseConnection: Connection | null = null;
 export async function connectMongoBase(): Promise<Connection> {
   if (baseConnection) return baseConnection;
 
-  const user = encodeURIComponent(process.env.mUser || "");
-  const pass = encodeURIComponent(process.env.pUser || "");
-  const host = "64.225.124.70";
-  const port = "27017";
-  const uri = `mongodb://${user}:${pass}@${host}:${port}/?authSource=admin`;
+  const user = encodeURIComponent(process.env.MONGO_USER || process.env.mUser || "");
+  const pass = encodeURIComponent(process.env.MONGO_PASS || process.env.pUser || "");
+  const host = process.env.MONGO_HOST || "64.225.124.70";
+  const port = process.env.MONGO_PORT || "27017";
+  const uri = process.env.MONGO_URI || `mongodb://${user}:${pass}@${host}:${port}/?authSource=admin`;
 
   const m = await mongoose.connect(uri);
   baseConnection = m.connection;

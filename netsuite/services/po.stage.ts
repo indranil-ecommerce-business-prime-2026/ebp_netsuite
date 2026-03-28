@@ -19,6 +19,10 @@ const VENDOR_MAP: Record<string, { default: { name: string; id: number }; dll: {
     "synnex": {
         default: { name: "TD Synnex - Term",             id: 116 },
         dll:     { name: "TD Synnex - DLL",               id: 117 }
+    },
+    "techdata": {
+        default: { name: "TD Synnex - Term",             id: 116 },
+        dll:     { name: "TD Synnex - DLL",               id: 117 }
     }
 };
 
@@ -68,7 +72,7 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
     // ── Filter: only POs after 2026-01-01 with status Shipped or Invoiced ──
     log.info("[PO Stage] Querying po_management (Shipped/Invoiced, created >= 2026-01-01)...");
     const po_cursor = po_db.collection("po_management").find({
-        status: { $in: ["Shipped", "Invoiced"] },
+        status2: { $in: ["shipped", "invoiced"] },
         created_at: { $gte: "2026-01-01" }
     });
 
@@ -89,7 +93,7 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
             website_order_number:     po.website_order_number     || "",
             distributor:              vendor.name,
             distributor_order_number: po.distributor_order_number  ?? null,
-            status:                   po.status                    || "",
+            status:                   po.status2                   || "",
             invoice:                  Array.isArray(po.invoice) ? po.invoice : [],
             vendor_id:                vendor.id,
             tracking:                 po.tracking ?? null,

@@ -21,11 +21,11 @@ dotenv.config();
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
-app.use(soRoutes);
-app.use(poRoutes);
-app.use(diagnosticRoutes);
-app.use(itemRoutes);
-app.use(indexRoutes);
+app.use("/api/v4", soRoutes);
+app.use("/api/v4", poRoutes);
+app.use("/api/v4", diagnosticRoutes);
+app.use("/api/v4", itemRoutes);
+app.use("/api/v4", indexRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SERVER
@@ -49,6 +49,7 @@ app.listen(PORT, () => {
     log.info(`  Retry Failed PO: GET  /retry-failed-po`);
     log.info(`  Test PO Flow:    POST /test-po-flow?type=dropship|stocking`);
     log.info(`  Direct PO Test:  POST /po-test`);
+    log.info(`  Dropship Ready:  GET  /dropship-ready`);
     log.info(`  Delete All PO:   GET|POST /delete-all-po`);
     log.info(`──── Bills ────`);
     log.info(`  Test Bill Flow:  GET  /test-bill-flow?po=987612345`);
@@ -68,29 +69,33 @@ app.listen(PORT, () => {
 // ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
 let soSyncRunning = false;
 
-// cron.schedule("*/15 * * * *", async () => {
-//     if (soSyncRunning) {
-//         log.warn("[CRON] [SO] Skipping — previous sync still running");
-//         return;
-//     }
-//     soSyncRunning = true;
-//     try {
-//         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-//         await stageSalesOrders();
+cron.schedule("*/15 * * * *", async () => {
+    if (soSyncRunning) {
+        log.warn("[CRON] [SO] Skipping — previous sync still running");
+        return;
+    }
+    soSyncRunning = true;
+    try {
+        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+        await stageSalesOrders();
 
-//         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-//         await syncSalesOrdersToNetsuite();
-//     } catch (err: any) {
-//         log.error("[CRON] [SO] Error", { error: err.message });
-//     } finally {
-//         soSyncRunning = false;
-//     }
-// });
+        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+        await syncSalesOrdersToNetsuite();
+    } catch (err: any) {
+        log.error("[CRON] [SO] Error", { error: err.message });
+    } finally {
+        soSyncRunning = false;
+    }
+});
 
-// ─── Every 20 mins — Purchase Orders (staging + sync) ────────────────────────
+// ─── PO sync offset from SO to avoid overlap ─────────────────────────────────
+// SO runs at :00, :15, :30, :45  →  PO runs at :07, :22, :37, :52
+// 7-min offset avoids :45 collision and gives SO a head start for dropship linking.
+// Governance per PO: Stocking ~42 units, Dropship ~77 units (RESTlet limit 5,000)
+// Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
 let poSyncRunning = false;
 
-cron.schedule("*/20 * * * *", async () => {
+cron.schedule("7,22,37,52 * * * *", async () => {
     if (poSyncRunning) {
         log.warn("[CRON] [PO] Skipping — previous sync still running");
         return;
@@ -110,15 +115,15 @@ cron.schedule("*/20 * * * *", async () => {
 });
 
 // ─── Daily 3 AM — Auto-retry permanently failed SOs ─────────────────────────
-// cron.schedule("0 3 * * *", async () => {
-//     log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
-//     try {
-//         const result = await retryFailedSalesOrders(true);
-//         log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
-//     } catch (err: any) {
-//         log.error("[CRON] [SO-RETRY] Error", { error: err.message });
-//     }
-// });
+cron.schedule("0 3 * * *", async () => {
+    log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
+    try {
+        const result = await retryFailedSalesOrders(true);
+        log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
+    } catch (err: any) {
+        log.error("[CRON] [SO-RETRY] Error", { error: err.message });
+    }
+});
 
 // ─── Every 30 mins — Item Sync (Phase 1 + Phase 2 chained) ──────────────────
 // Phase 1: SuiteQL bulk fetch (5 parallel workers, 5000/page → ~12-16s for 96k)

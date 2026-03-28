@@ -1,25 +1,61 @@
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuiteForPO } from "./netsuite.client";
 import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 
+// ── Governance budget ────────────────────────────────────────────────────────
+// RESTlet limit: 5,000 units/invocation
+// Stocking PO:  ~42 units (4 SKUs)  → ~119 POs per invocation (never hit — 1 PO/call)
+// Dropship PO:  ~77 units (1 SKU)   → ~64 POs per invocation  (never hit — 1 PO/call)
+// Each HTTP call = 1 RESTlet invocation, so governance is never a concern.
+// Batch limits below control server-side concurrency + NetSuite rate limits.
 const PARALLEL_WORKERS = 5;
-const BATCH_LIMIT = 700;
+const STOCKING_BATCH = 50;
+const DROPSHIP_BATCH = 20;   // lower — each dropship PO touches SO too
 
 export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
     log.info(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
 
     const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_purchase_order");
+    const soCollection = ns_db.collection("suite_sales_order");
 
-    // In "update" mode, re-process all orders (including previously synced).
-    // In "skip" mode, only pick up unsynced orders.
-    // Always exclude permanently failed orders.
-    const filter = SYNC_MODE === "update"
+    // Base filter: skip permanently failed; in "skip" mode also skip already-synced
+    const baseFilter = SYNC_MODE === "update"
         ? { ns_failed: { $ne: true } }
         : { ns_synced: { $ne: true }, ns_failed: { $ne: true } };
 
-    const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
+    // ── Phase 1: Stocking POs (no SO dependency) ────────────────────────
+    const stockingOrders = await collection
+        .find({ ...baseFilter, po_type: { $ne: "Dropship" } })
+        .limit(STOCKING_BATCH)
+        .toArray();
+
+    // ── Phase 2: Dropship POs (only if SO is synced) ────────────────────
+    const dropshipCandidates = await collection
+        .find({ ...baseFilter, po_type: "Dropship", website_order_number: { $exists: true, $ne: "" } })
+        .limit(DROPSHIP_BATCH * 2)  // fetch extra — some may not have synced SOs
+        .toArray();
+
+    // Filter to only those whose SO is synced
+    let dropshipOrders: any[] = [];
+    if (dropshipCandidates.length > 0) {
+        const orderNumbers = dropshipCandidates.map((p: any) => p.website_order_number);
+        const syncedSOs = await soCollection
+            .find({ otherrefnum: { $in: orderNumbers }, ns_synced: true, ns_result: "created" })
+            .project({ otherrefnum: 1 })
+            .toArray();
+        const syncedSet = new Set(syncedSOs.map((s: any) => s.otherrefnum));
+
+        dropshipOrders = dropshipCandidates
+            .filter((p: any) => syncedSet.has(p.website_order_number))
+            .slice(0, DROPSHIP_BATCH);
+
+        log.info(`[NS PO Sync] Dropship: ${dropshipCandidates.length} candidates, ${syncedSOs.length} with synced SO, ${dropshipOrders.length} ready`);
+    }
+
+    const orders = [...stockingOrders, ...dropshipOrders];
 
     if (orders.length === 0) {
         log.info("[NS PO Sync] No unsynced purchase orders. Skipping.");
@@ -64,7 +100,7 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
 async function syncOnePO(collection: any, po: any): Promise<any> {
     const t0 = Date.now();
     try {
-        const result = await postToNetsuiteForPO({
+        const result = await withConcurrency(() => postToNetsuiteForPO({
             action:                   SYNC_MODE,
             po_number:                po.po_number,
             otherrefnum:              String(po.po_number),
@@ -78,7 +114,7 @@ async function syncOnePO(collection: any, po: any): Promise<any> {
             website_order_number:     po.website_order_number,
             po_type:                  po.po_type || "",
             stocking_warehouse:       po.stocking_warehouse || ""
-        });
+        }), `PO ${po.po_number}`);
 
         const ms = Date.now() - t0;
 

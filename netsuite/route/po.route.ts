@@ -142,6 +142,64 @@ router.post("/test-po-flow", async (req: any, res: any) => {
     }
 });
 
+// ─── Dropship POs with synced SOs ───────────────────────────────────────────
+// Returns website_order_numbers where:
+//   suite_purchase_order.po_type = "Dropship"
+//   AND a matching suite_sales_order (otherrefnum = website_order_number)
+//   has ns_synced=true, ns_result="created"
+router.get("/dropship-ready", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const poColl = nsDb.collection("suite_purchase_order");
+        const soColl = nsDb.collection("suite_sales_order");
+
+        // 1. All dropship PO website_order_numbers
+        const dropshipPOs = await poColl
+            .find({ po_type: "Dropship", website_order_number: { $exists: true, $ne: "" } })
+            .project({ website_order_number: 1, po_number: 1, vendor_id: 1, ns_synced: 1 })
+            .toArray();
+
+        if (dropshipPOs.length === 0) {
+            return res.json({ success: true, count: 0, matched: [] });
+        }
+
+        const orderNumbers = dropshipPOs.map((p: any) => p.website_order_number);
+
+        // 2. Synced SOs whose otherrefnum matches
+        const syncedSOs = await soColl
+            .find({
+                otherrefnum: { $in: orderNumbers },
+                ns_synced: true,
+                ns_result: "created",
+            })
+            .project({ otherrefnum: 1 })
+            .toArray();
+
+        const syncedSet = new Set(syncedSOs.map((s: any) => s.otherrefnum));
+
+        // 3. Build matched list
+        const matched = dropshipPOs
+            .filter((p: any) => syncedSet.has(p.website_order_number))
+            .map((p: any) => ({
+                website_order_number: p.website_order_number,
+                po_number: p.po_number,
+                vendor_id: p.vendor_id,
+                po_synced: !!p.ns_synced,
+            }));
+
+        res.json({
+            success: true,
+            total_dropship_pos: dropshipPOs.length,
+            total_synced_sos: syncedSOs.length,
+            count: matched.length,
+            matched,
+        });
+    } catch (e: any) {
+        log.error("[DROPSHIP-READY] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 // ─── Delete All POs ─────────────────────────────────────────────────────────
 // GET  /delete-all-po → dry-run
 // POST /delete-all-po → delete

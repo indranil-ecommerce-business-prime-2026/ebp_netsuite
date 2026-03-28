@@ -1,6 +1,7 @@
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuite } from "./netsuite.client";
 import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 
 const PARALLEL_WORKERS = 5;
@@ -69,7 +70,7 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
 // ── Process a single order: RESTlet call + MongoDB status update ──────────
 async function syncOneOrder(collection: any, order: any): Promise<any> {
     try {
-        const result = await postToNetsuite({
+        const result = await withConcurrency(() => postToNetsuite({
             action:              SYNC_MODE,
             otherrefnum:         order.otherrefnum,
             trandate:            order.trandate,
@@ -80,7 +81,7 @@ async function syncOneOrder(collection: any, order: any): Promise<any> {
             items:               order.items,
             po:                  order.po,
             shipping_address:    order.shipping_address || null,
-        });
+        }), `SO ${order.otherrefnum}`);
 
         if (result.action === "no_items") {
             await collection.updateOne(

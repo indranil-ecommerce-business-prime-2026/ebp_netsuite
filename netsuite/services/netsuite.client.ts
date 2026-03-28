@@ -39,14 +39,27 @@ const post = async (scriptId: string, deployId: string, payload: object): Promis
 
     const authHeader = buildOAuthHeader(url, "POST");
 
-    const response = await axios.post(url, payload, {
-        headers: {
-            Authorization: authHeader,
-            "Content-Type": "application/json"
+    try {
+        const response = await axios.post(url, payload, {
+            headers: {
+                Authorization: authHeader,
+                "Content-Type": "application/json"
+            }
+        });
+        log.debug("[NS Client] Response", { action: response.data?.action, success: response.data?.success, itemCount: response.data?.fetch_items_fast?.count });
+        return response.data;
+    } catch (err: any) {
+        const status = err.response?.status;
+        const body = err.response?.data;
+        const msg = typeof body === "string" ? body : JSON.stringify(body || err.message);
+
+        // NetSuite concurrency limit hit — 429 or SSS_REQUEST_LIMIT_EXCEEDED
+        if (status === 429 || msg.includes("SSS_REQUEST_LIMIT_EXCEEDED") || msg.includes("concurrent request")) {
+            log.error(`[NS Client] ⚠️ CONCURRENCY LIMIT HIT — NetSuite rejected the request (HTTP ${status}). Reduce NS_MAX_CONCURRENT or batch sizes.`, { url, error: msg });
         }
-    });
-    log.debug("[NS Client] Response", { action: response.data?.action, success: response.data?.success, itemCount: response.data?.fetch_items_fast?.count });
-    return response.data;
+
+        throw err;
+    }
 };
 
 // Sales Order restlet
