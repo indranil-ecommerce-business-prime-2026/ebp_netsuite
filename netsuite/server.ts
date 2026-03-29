@@ -6,12 +6,15 @@ import { getDb } from "./config/mongdodb.config";
 import { retryFailedSalesOrders, syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
 import { stagePurchaseOrders } from "./services/po.stage";
 import { syncPurchaseOrdersToNetsuite } from "./services/po.sync";
+import { stageBills } from "./services/bill.stage";
+import { syncBillsToNetsuite, retryFailedBills } from "./services/bill.sync";
 import { runItemFullSync } from "./controller/netsuite_item_full";
 
 // Route modules
 import soRoutes from "./route/so.route";
 import poRoutes from "./route/po.route";
 import diagnosticRoutes from "./route/diagnostic.route";
+import billRoutes from "./route/bill.route";
 import itemRoutes from "./route/item.route";
 import indexRoutes from "./route/index.route";
 import { stageSalesOrders } from "./services/sales_order.stage";
@@ -23,6 +26,7 @@ dotenv.config();
 // ═══════════════════════════════════════════════════════════════════════════════
 app.use("/api/v4", soRoutes);
 app.use("/api/v4", poRoutes);
+app.use("/api/v4", billRoutes);
 app.use("/api/v4", diagnosticRoutes);
 app.use("/api/v4", itemRoutes);
 app.use("/api/v4", indexRoutes);
@@ -51,9 +55,19 @@ app.listen(PORT, () => {
     log.info(`  Direct PO Test:  POST /po-test`);
     log.info(`  Dropship Ready:  GET  /dropship-ready`);
     log.info(`  Delete All PO:   GET|POST /delete-all-po`);
-    log.info(`──── Bills ────`);
-    log.info(`  Test Bill Flow:  GET  /test-bill-flow?po=987612345`);
+    log.info(`──── Vendor Bills ────`);
+    log.info(`  Stage Bills:     GET  /stage-bill`);
+    log.info(`  Sync Bills:      GET  /sync-bill`);
+    log.info(`  Retry Failed:    GET  /retry-failed-bill`);
+    log.info(`  Reset Sync:      GET|POST /reset-bill-sync`);
+    log.info(`  Bill Ready:      GET  /bill-ready`);
     log.info(`  Direct Bill:     POST /bill-test`);
+    log.info(`──── Cron Schedule ────`);
+    log.info(`  SO:   every 90 min  (0:00, 1:30, 3:00, 4:30 ...)`);
+    log.info(`  PO:   every 20 min  (:07, :27, :47)`);
+    log.info(`  Bill: every 20 min  (:14, :34, :54)`);
+    log.info(`  SO retry:   daily 3:00 AM`);
+    log.info(`  Bill retry: daily 3:30 AM`);
     log.info(`──── Items & Diagnostics ────`);
     log.info(`  Items:           GET  /netsuite-items`);
     log.info(`  Items Full:      GET  /netsuite-items-full`);
@@ -66,10 +80,13 @@ app.listen(PORT, () => {
 // CRON JOBS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ─── Every 30 mins — Sales Orders (staging + sync) ──────────────────────────
+// ─── Every 90 min — Sales Orders (staging + sync) ─────────────────────────
+// 90 min = two cron entries sharing one guard.
+// Runs at: 0:00, 1:30, 3:00, 4:30, 6:00, 7:30, 9:00, 10:30,
+//          12:00, 13:30, 15:00, 16:30, 18:00, 19:30, 21:00, 22:30
 let soSyncRunning = false;
 
-cron.schedule("*/15 * * * *", async () => {
+async function runSOSync() {
     if (soSyncRunning) {
         log.warn("[CRON] [SO] Skipping — previous sync still running");
         return;
@@ -86,16 +103,18 @@ cron.schedule("*/15 * * * *", async () => {
     } finally {
         soSyncRunning = false;
     }
-});
+}
 
-// ─── PO sync offset from SO to avoid overlap ─────────────────────────────────
-// SO runs at :00, :15, :30, :45  →  PO runs at :07, :22, :37, :52
-// 7-min offset avoids :45 collision and gives SO a head start for dropship linking.
+cron.schedule("0 0,3,6,9,12,15,18,21 * * *", runSOSync);   // even hours :00
+cron.schedule("30 1,4,7,10,13,16,19,22 * * *", runSOSync);  // odd hours :30
+
+// ─── Every 20 min — Purchase Orders (staging + sync) ──────────────────────
+// PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
 // Governance per PO: Stocking ~42 units, Dropship ~77 units (RESTlet limit 5,000)
 // Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
 let poSyncRunning = false;
 
-cron.schedule("7,22,37,52 * * * *", async () => {
+cron.schedule("7,27,47 * * * *", async () => {
     if (poSyncRunning) {
         log.warn("[CRON] [PO] Skipping — previous sync still running");
         return;
@@ -114,6 +133,30 @@ cron.schedule("7,22,37,52 * * * *", async () => {
     }
 });
 
+// ─── Every 20 min — Bill sync offset from PO ─────────────────────────────
+// SO at :00/:30 → PO at :07/:27/:47 → Bill at :14/:34/:54
+// 7-min gap between each job. Bills depend on PO being synced first.
+let billSyncRunning = false;
+
+// cron.schedule("14,34,54 * * * *", async () => {
+//     if (billSyncRunning) {
+//         log.warn("[CRON] [BILL] Skipping — previous sync still running");
+//         return;
+//     }
+//     billSyncRunning = true;
+//     try {
+//         log.info("[CRON] [BILL] Step 1 — Staging bills...");
+//         await stageBills();
+
+//         log.info("[CRON] [BILL] Step 2 — Pushing to NetSuite...");
+//         await syncBillsToNetsuite();
+//     } catch (err: any) {
+//         log.error("[CRON] [BILL] Error", { error: err.message });
+//     } finally {
+//         billSyncRunning = false;
+//     }
+// });
+
 // ─── Daily 3 AM — Auto-retry permanently failed SOs ─────────────────────────
 cron.schedule("0 3 * * *", async () => {
     log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
@@ -122,6 +165,17 @@ cron.schedule("0 3 * * *", async () => {
         log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
     } catch (err: any) {
         log.error("[CRON] [SO-RETRY] Error", { error: err.message });
+    }
+});
+
+// ─── Daily 3:30 AM — Auto-retry permanently failed Bills ────────────────
+cron.schedule("30 3 * * *", async () => {
+    log.info("[CRON] [BILL-RETRY] Resetting permanently failed bills for retry...");
+    try {
+        const result = await retryFailedBills(true);
+        log.info(`[CRON] [BILL-RETRY] Reset ${result.count} failed bills for retry`);
+    } catch (err: any) {
+        log.error("[CRON] [BILL-RETRY] Error", { error: err.message });
     }
 });
 
