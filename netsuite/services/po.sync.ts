@@ -1,5 +1,5 @@
 import { getDb } from "../config/mongdodb.config";
-import { postToNetsuiteForPO } from "./netsuite.client";
+import { postToNetsuiteForPO, postBatchToNetsuiteForPO } from "./netsuite.client";
 import { SYNC_MODE_PO as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
@@ -11,8 +11,9 @@ import log from "../config/logger.config";
 // Each HTTP call = 1 RESTlet invocation, so governance is never a concern.
 // Batch limits below control server-side concurrency + NetSuite rate limits.
 const PARALLEL_WORKERS = 5;
-const STOCKING_BATCH = 70;
-const DROPSHIP_BATCH = 70;   // lower — each dropship PO touches SO too
+const BATCH_SIZE = 10;           // POs per RESTlet call (batch mode)
+const STOCKING_BATCH = 200;      // raised — fewer HTTP calls now
+const DROPSHIP_BATCH = 200;      // raised — fewer HTTP calls now
 
 // Parse created_at safely — sends "M/D/YYYY" to avoid UTC→timezone date shift.
 // NetSuite trandate only needs a date, not a time.
@@ -25,7 +26,7 @@ function toSafeISO(raw: any): string {
 }
 
 export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
-    log.info(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
+    log.info(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, batchSize: ${BATCH_SIZE}, stopOnError: ${STOP_ON_ERROR}`);
 
     const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_purchase_order");
@@ -79,32 +80,158 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
         return syncSerial(collection, orders);
     }
 
-    // ── Parallel sync with worker pool ────────────────────────────────────
+    // ── Split orders into batches of BATCH_SIZE ───────────────────────────
+    const batches: any[][] = [];
+    for (let i = 0; i < orders.length; i += BATCH_SIZE) {
+        batches.push(orders.slice(i, i + BATCH_SIZE));
+    }
+
+    log.info(`[NS PO Sync] Split ${orders.length} POs into ${batches.length} batches of up to ${BATCH_SIZE}`);
+
+    // ── Parallel sync with worker pool (one batch per worker iteration) ──
     let sent = 0;
     let errors = 0;
     let skipped = 0;
     const results: any[] = [];
-    let index = 0;
+    let batchIndex = 0;
 
     async function worker() {
-        while (index < orders.length) {
-            const i = index++;
-            const entry = await syncOnePO(collection, orders[i]);
-            results[i] = entry;
-
-            if (entry.action === "no_items" || entry.action === "skipped") skipped++;
-            else if (entry.success === false) errors++;
-            else sent++;
+        while (batchIndex < batches.length) {
+            const bi = batchIndex++;
+            const batchResults = await syncBatchPO(collection, batches[bi]);
+            for (const entry of batchResults) {
+                results.push(entry);
+                if (entry.action === "no_items" || entry.action === "skipped") skipped++;
+                else if (entry.success === false) errors++;
+                else sent++;
+            }
         }
     }
 
     await Promise.all(
-        Array.from({ length: Math.min(PARALLEL_WORKERS, orders.length) }, () => worker())
+        Array.from({ length: Math.min(PARALLEL_WORKERS, batches.length) }, () => worker())
     );
 
-    log.info(`[NS PO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+    log.info(`[NS PO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}, batches: ${batches.length}`);
     return results;
 };
+
+// ── Process a batch of POs: single RESTlet call + per-PO MongoDB updates ──────
+async function syncBatchPO(collection: any, batch: any[]): Promise<any[]> {
+    const t0 = Date.now();
+    const results: any[] = [];
+
+    // Build payloads & filter out invalid POs
+    const validPOs: any[] = [];
+    const payloads: any[] = [];
+
+    for (const po of batch) {
+        if (!po.po_number && po.po_number !== 0) {
+            log.warn(`[NS PO Sync] Skipping PO _id=${po._id} — missing po_number`);
+            await collection.updateOne(
+                { _id: po._id },
+                { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "skipped_no_po_number" } }
+            );
+            results.push({ po_number: null, success: true, action: "skipped", reason: "missing_po_number" });
+            continue;
+        }
+
+        validPOs.push(po);
+        payloads.push({
+            action: SYNC_MODE,
+            po_number: po.po_number,
+            otherrefnum: String(po.po_number),
+            vendor_id: po.vendor_id,
+            distributor: po.distributor,
+            distributor_order_number: po.distributor_order_number,
+            status: po.status,
+            invoice: po.invoice,
+            tracking: po.tracking,
+            order_items: po.order_items,
+            website_order_number: po.website_order_number,
+            po_type: po.po_type || "",
+            stocking_warehouse: po.stocking_warehouse || "",
+            created_at: toSafeISO(po.created_at)
+        });
+    }
+
+    if (payloads.length === 0) return results;
+
+    try {
+        // Single HTTP call for the entire batch via concurrency semaphore
+        const batchLabel = `PO batch [${validPOs.map((p: any) => p.po_number).join(",")}]`;
+        const response = await withConcurrency(() => postBatchToNetsuiteForPO(payloads), batchLabel);
+
+        const ms = Date.now() - t0;
+        const nsResults: any[] = response?.results || [];
+
+        // Process each result from the batch response
+        for (let i = 0; i < validPOs.length; i++) {
+            const po = validPOs[i];
+            const result = nsResults[i];
+
+            if (!result) {
+                // No result for this PO — shouldn't happen but handle gracefully
+                log.error(`[NS PO Sync] No result for PO ${po.po_number} in batch response`);
+                await markFailed(collection, po, "no_result_in_batch");
+                results.push({ po_number: po.po_number, success: false, error: "no_result_in_batch", ms });
+                continue;
+            }
+
+            // Governance exhausted — RESTlet couldn't process this PO
+            if (result.error === "governance_exhausted") {
+                log.warn(`[NS PO Sync] Governance exhausted for PO ${po.po_number} — will retry next cycle`);
+                results.push({ po_number: po.po_number, success: false, error: "governance_exhausted", ms });
+                continue;
+            }
+
+            // no_items = SKUs not found in NetSuite
+            if (result.action === "no_items") {
+                await collection.updateOne(
+                    { _id: po._id },
+                    { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
+                );
+                log.info(`[NS PO Sync] No items — skipped: ${po.po_number}`);
+                results.push({ po_number: po.po_number, success: true, action: "no_items", ms });
+                continue;
+            }
+
+            // NetSuite returned success: false
+            if (result.success === false) {
+                log.error(`[NS PO Sync] Failed: ${po.po_number} → ${result.error}`);
+                await markFailed(collection, po, result.error);
+                results.push({ po_number: po.po_number, success: false, error: result.error, ms });
+                continue;
+            }
+
+            // Mark as synced
+            await collection.updateOne(
+                { _id: po._id },
+                {
+                    $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: result.action },
+                    $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
+                }
+            );
+            log.info(`[NS PO Sync] Synced: ${po.po_number} → ${result.action}`);
+            results.push({ po_number: po.po_number, ...result, ms });
+        }
+
+        log.info(`[NS PO Sync] Batch of ${validPOs.length} completed in ${ms}ms`);
+
+    } catch (e: any) {
+        const ms = Date.now() - t0;
+        const errMsg = e?.response?.data || e.message;
+        log.error(`[NS PO Sync] Batch call failed (${ms}ms): ${errMsg} — falling back to individual calls`);
+
+        // Fallback: process each PO individually
+        for (const po of validPOs) {
+            const entry = await syncOnePO(collection, po);
+            results.push(entry);
+        }
+    }
+
+    return results;
+}
 
 // ── Process a single PO: RESTlet call + MongoDB status update ─────────────
 async function syncOnePO(collection: any, po: any): Promise<any> {
@@ -122,20 +249,20 @@ async function syncOnePO(collection: any, po: any): Promise<any> {
 
     try {
         const result = await withConcurrency(() => postToNetsuiteForPO({
-            action:                   SYNC_MODE,
-            po_number:                po.po_number,
-            otherrefnum:              String(po.po_number),
-            vendor_id:                po.vendor_id,
-            distributor:              po.distributor,
+            action: SYNC_MODE,
+            po_number: po.po_number,
+            otherrefnum: String(po.po_number),
+            vendor_id: po.vendor_id,
+            distributor: po.distributor,
             distributor_order_number: po.distributor_order_number,
-            status:                   po.status,
-            invoice:                  po.invoice,
-            tracking:                 po.tracking,
-            order_items:              po.order_items,
-            website_order_number:     po.website_order_number,
-            po_type:                  po.po_type || "",
-            stocking_warehouse:       po.stocking_warehouse || "",
-            created_at:               toSafeISO(po.created_at)
+            status: po.status,
+            invoice: po.invoice,
+            tracking: po.tracking,
+            order_items: po.order_items,
+            website_order_number: po.website_order_number,
+            po_type: po.po_type || "",
+            stocking_warehouse: po.stocking_warehouse || "",
+            created_at: toSafeISO(po.created_at)
         }), `PO ${po.po_number}`);
 
         const ms = Date.now() - t0;

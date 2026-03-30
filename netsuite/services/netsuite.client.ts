@@ -70,6 +70,25 @@ export const postToNetsuite = (payload: object) =>
 export const postToNetsuiteForPO = (payload: object) =>
     post(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!, payload);
 
+// Purchase Order restlet — batch mode (multiple POs in one invocation)
+export const postBatchToNetsuiteForPO = (payloads: object[]): Promise<any> => {
+    const url = buildRestletUrl(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!);
+    const authHeader = buildOAuthHeader(url, "POST");
+    log.info(`[NS Client] BATCH POST → ${url} (${payloads.length} POs)`);
+    return axios.post(url, { batch: payloads }, {
+        headers: { Authorization: authHeader, "Content-Type": "application/json" },
+        timeout: 180_000,  // 3 min — batch calls take longer
+    }).then((r: any) => r.data).catch((err: any) => {
+        const status = err.response?.status;
+        const body = err.response?.data;
+        const msg = typeof body === "string" ? body : JSON.stringify(body || err.message);
+        if (status === 429 || msg.includes("SSS_REQUEST_LIMIT_EXCEEDED") || msg.includes("concurrent request")) {
+            log.error(`[NS Client] ⚠️ CONCURRENCY LIMIT HIT on batch call (HTTP ${status})`, { url, error: msg });
+        }
+        throw err;
+    });
+};
+
 // Vendor Bill restlet
 export const postToNetsuiteForBill = (payload: object) =>
     post(process.env.RESTLET_BILL_SCRIPT_ID!, process.env.RESTLET_BILL_DEPLOY_ID!, payload);

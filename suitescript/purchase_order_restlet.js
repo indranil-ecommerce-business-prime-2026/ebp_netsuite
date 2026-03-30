@@ -33,7 +33,7 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/record", "N/search", "N/query", "N/log"], function (record, search, query, log) {
+define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search, log, runtime) {
 
     // ── Caches ─────────────────────────────────────────────────────────────
     var _formCache = {};
@@ -41,7 +41,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
 
     // ── Warehouse map: stocking_warehouse code → NetSuite location name ──
     var WAREHOUSE_MAP = {
-        "MW":     "California - Chatsworth",
+        "MW": "California - Chatsworth",
         "W2G-PA": "Ware2Go - PA (Fairless Hills)",
         "W2G-IL": "Ware2Go - IL (Aurora)",
         "W2G-KY": "Ware2Go - KY (Hebron)",
@@ -59,7 +59,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
         for (var hi = 0; hi < headerFields.length; hi++) {
             try {
                 snap.header[headerFields[hi]] = poRecord.getValue({ fieldId: headerFields[hi] });
-            } catch (e) {}
+            } catch (e) { }
         }
         var lineCount = poRecord.getLineCount({ sublistId: "item" });
         snap.header.lineCount = lineCount;
@@ -72,7 +72,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                     line[lineFields[lf]] = poRecord.getSublistValue({
                         sublistId: "item", fieldId: lineFields[lf], line: li
                     });
-                } catch (e) {}
+                } catch (e) { }
             }
             snap.lines.push(line);
         }
@@ -188,14 +188,14 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             var soShip = so.getSubrecord({ fieldId: "shippingaddress" });
 
             var addrFields = {
-                country:   soShip.getValue({ fieldId: "country" }) || "US",
+                country: soShip.getValue({ fieldId: "country" }) || "US",
                 addressee: soShip.getValue({ fieldId: "addressee" }) || "",
                 attention: soShip.getValue({ fieldId: "attention" }) || "",
-                addr1:     soShip.getValue({ fieldId: "addr1" }) || "",
-                addr2:     soShip.getValue({ fieldId: "addr2" }) || "",
-                city:      soShip.getValue({ fieldId: "city" }) || "",
-                state:     soShip.getValue({ fieldId: "state" }) || "",
-                zip:       soShip.getValue({ fieldId: "zip" }) || "",
+                addr1: soShip.getValue({ fieldId: "addr1" }) || "",
+                addr2: soShip.getValue({ fieldId: "addr2" }) || "",
+                city: soShip.getValue({ fieldId: "city" }) || "",
+                state: soShip.getValue({ fieldId: "state" }) || "",
+                zip: soShip.getValue({ fieldId: "zip" }) || "",
                 addrphone: soShip.getValue({ fieldId: "addrphone" }) || ""
             };
 
@@ -205,14 +205,14 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             po.setValue({ fieldId: "shipaddresslist", value: "" });
 
             var poShip = po.getSubrecord({ fieldId: "shippingaddress" });
-            poShip.setValue({ fieldId: "country",   value: addrFields.country });
+            poShip.setValue({ fieldId: "country", value: addrFields.country });
             poShip.setValue({ fieldId: "addressee", value: addrFields.addressee });
             if (addrFields.attention) poShip.setValue({ fieldId: "attention", value: addrFields.attention });
             poShip.setValue({ fieldId: "addr1", value: addrFields.addr1 });
             if (addrFields.addr2) poShip.setValue({ fieldId: "addr2", value: addrFields.addr2 });
-            poShip.setValue({ fieldId: "city",  value: addrFields.city });
+            poShip.setValue({ fieldId: "city", value: addrFields.city });
             poShip.setValue({ fieldId: "state", value: addrFields.state });
-            poShip.setValue({ fieldId: "zip",   value: addrFields.zip });
+            poShip.setValue({ fieldId: "zip", value: addrFields.zip });
             if (addrFields.addrphone) poShip.setValue({ fieldId: "addrphone", value: addrFields.addrphone });
 
             log.debug("PO_SHIP_ADDR_SET", "Copied SO " + soId + " shipping address to PO");
@@ -343,7 +343,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
         // Use PO created_at date if provided (ISO string from server), otherwise today
         var poDate = opts.created_at ? new Date(opts.created_at) : new Date();
         if (isNaN(poDate.getTime())) poDate = new Date();
-        po.setValue({ fieldId: "trandate",    value: poDate });
+        po.setValue({ fieldId: "trandate", value: poDate });
 
         try { po.setValue({ fieldId: "custbody2", value: String(opts.distributor_order_number || opts.po_number) }); } catch (e) {
             log.debug("FIELD_SKIP", "custbody2: " + e.message);
@@ -372,12 +372,12 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             so.selectLine({ sublistId: "item", line: ci });
             try {
                 so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: " ", ignoreFieldChange: true });
-                so.setCurrentSublistValue({ sublistId: "item", fieldId: "povendor", value: "",  ignoreFieldChange: true });
+                so.setCurrentSublistValue({ sublistId: "item", fieldId: "povendor", value: "", ignoreFieldChange: true });
                 so.commitLine({ sublistId: "item" });
                 cleared++;
             } catch (lineErr) {
                 log.debug("SO_CLEAR_LINE_ERR", "Line " + ci + ": " + lineErr.message);
-                try { so.cancelLine({ sublistId: "item" }); } catch (e) {}
+                try { so.cancelLine({ sublistId: "item" }); } catch (e) { }
             }
         }
 
@@ -386,8 +386,8 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
         return { soId: cleanedId, linesCleared: cleared, totalLines: lineCount };
     }
 
-    // ── Main POST handler ───────────────────────────────────────────────
-    function post(payload) {
+    // ── Single-PO handler (was previously the `post` entry point) ────────
+    function processSinglePO(payload) {
         var before = null;
         var after = null;
         var diff = null;
@@ -395,19 +395,19 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
         try {
             log.debug("PAYLOAD", JSON.stringify(payload));
 
-            var action                   = payload.action || "skip";
-            var po_number                = payload.po_number;
-            var otherrefnum              = payload.otherrefnum;
-            var vendor_id                = payload.vendor_id;
-            var distributor              = payload.distributor || "";
+            var action = payload.action || "skip";
+            var po_number = payload.po_number;
+            var otherrefnum = payload.otherrefnum;
+            var vendor_id = payload.vendor_id;
+            var distributor = payload.distributor || "";
             var distributor_order_number = payload.distributor_order_number || "";
-            var status                   = payload.status || "";
-            var invoice                  = payload.invoice;
-            var website_order_number     = payload.website_order_number || "";
-            var order_items              = payload.order_items;
-            var po_type                  = payload.po_type || "";
-            var stocking_warehouse       = payload.stocking_warehouse || "";
-            var created_at               = payload.created_at || "";
+            var status = payload.status || "";
+            var invoice = payload.invoice;
+            var website_order_number = payload.website_order_number || "";
+            var order_items = payload.order_items;
+            var po_type = payload.po_type || "";
+            var stocking_warehouse = payload.stocking_warehouse || "";
+            var created_at = payload.created_at || "";
 
             if (!po_number || String(po_number).trim() === "") {
                 return { success: false, error: "Missing or empty po_number" };
@@ -624,19 +624,21 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                             try {
                                 po = record.transform({
                                     fromType: record.Type.SALES_ORDER,
-                                    fromId:   parseInt(linkedSoId, 10),
-                                    toType:   record.Type.PURCHASE_ORDER,
+                                    fromId: parseInt(linkedSoId, 10),
+                                    toType: record.Type.PURCHASE_ORDER,
                                     isDynamic: true,
                                     defaultValues: { entity: parseInt(vendor_id, 10) }
                                 });
                                 // Force explicit link just in case
-                                try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                                try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) { }
                             } catch (transformErr) {
                                 // transform failed — last resort: create standalone PO
-                                log.error("TRANSFORM_FAILED", transformErr.message);
+                                var transformErrMsg = transformErr.message || "Unknown error";
+                                log.error("TRANSFORM_FAILED", transformErrMsg);
                                 po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+                                try { po.setValue({ fieldId: "memo", value: "PO-SO Link Failed: " + transformErrMsg }); } catch (e) { }
                                 if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
-                                try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                                try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) { }
                             }
                             isDropshipCreate = true;
 
@@ -666,21 +668,22 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                         try {
                             po = record.transform({
                                 fromType: record.Type.SALES_ORDER,
-                                fromId:   parseInt(linkedSoId, 10),
-                                toType:   record.Type.PURCHASE_ORDER,
+                                fromId: parseInt(linkedSoId, 10),
+                                toType: record.Type.PURCHASE_ORDER,
                                 isDynamic: true,
                                 defaultValues: { entity: parseInt(vendor_id, 10) }
                             });
                             // Force explicit link just in case
-                            try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                            try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) { }
                         } catch (transformErr2) {
-                            transformErrObj = transformErr2.message;
-                            log.error("TRANSFORM_FAILED_CATCH", transformErr2.message);
+                            transformErrObj = transformErr2.message || "Unknown error";
+                            log.error("TRANSFORM_FAILED_CATCH", transformErrObj);
                             po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+                            try { po.setValue({ fieldId: "memo", value: "PO-SO Link Failed: " + transformErrObj }); } catch (e) { }
                             if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
-                            try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                            try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) { }
                         }
-                        
+
                         isDropshipCreate = true;
                         if (transformErrObj) {
                             soSetupResult.transformError = transformErrObj;
@@ -688,7 +691,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
 
                         var dsFormId3 = findFormId("Ecomm BP - Purchase Order");
                         if (dsFormId3) po.setValue({ fieldId: "customform", value: parseInt(dsFormId3, 10) });
-                        if (vendor_id) po.setValue({ fieldId: "entity",    value: parseInt(vendor_id, 10) });
+                        if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
                         setPOHeaders(po, headerOpts);
 
                         // Clean up SO — remove Drop Ship from lines (best-effort)
@@ -749,7 +752,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             }
 
             var poSubsidiary = "";
-            try { poSubsidiary = po.getValue({ fieldId: "subsidiary" }); } catch (e) {}
+            try { poSubsidiary = po.getValue({ fieldId: "subsidiary" }); } catch (e) { }
             log.debug("ENTITY_SET", JSON.stringify({
                 vendor: vendor_id,
                 subsidiary: poSubsidiary,
@@ -833,7 +836,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: newItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: newItem.cost, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: newItem.qty * newItem.cost, ignoreFieldChange: false });
-                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) {}
+                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) { }
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                     } catch (addErr) {
@@ -879,11 +882,11 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                     try {
                         po.selectNewLine({ sublistId: "item" });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "item", value: stdItem.itemId, ignoreFieldChange: false });
-                        
+
                         // 🔗 Hard-link to SO Line
                         if (linkedSoId && soLineMap[stdItem.itemId]) {
-                            try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "orderdoc", value: linkedSoId, ignoreFieldChange: false }); } catch(e){}
-                            try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "orderline", value: soLineMap[stdItem.itemId], ignoreFieldChange: false }); } catch(e){}
+                            try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "orderdoc", value: linkedSoId, ignoreFieldChange: false }); } catch (e) { }
+                            try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "orderline", value: soLineMap[stdItem.itemId], ignoreFieldChange: false }); } catch (e) { }
                         }
 
                         if (locationId) {
@@ -891,7 +894,7 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                         }
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: stdItem.cost, ignoreFieldChange: false });
-                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) {}
+                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) { }
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                         log.debug("ITEM_ADDED", "SKU \"" + stdItem.sku + "\" → lines now: " + po.getLineCount({ sublistId: "item" }));
@@ -925,17 +928,8 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                 };
             }
 
-            // ── Set shipping address ─────────────────────────────────────────
-            var shipResult = null;
-            if (po_type === "Dropship" && linkedSoId) {
-                shipResult = copySOShippingToPO(linkedSoId, po);
-            } else if (po_type === "Stocking" && locationId) {
-                shipResult = setStockingShipAddress(po, locationId);
-            }
-            if (shipResult) log.debug("SHIP_ADDRESS", JSON.stringify(shipResult));
-
             // ── Clear auto-sourced class to avoid subsidiary mismatch ────────
-            try { po.setValue({ fieldId: "class", value: "" }); } catch (e) {}
+            try { po.setValue({ fieldId: "class", value: "" }); } catch (e) { }
 
             // ── SNAPSHOT: AFTER (before save) ────────────────────────────────
             after = snapshotPO(po);
@@ -1015,6 +1009,73 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
         return {
             id: parseInt(rows[0].id, 10),
             poNumber: rows[0].tranid
+        };
+    }
+
+    // ── Main POST entry point — supports batch mode ─────────────────────
+    // Single:  { action: "skip", po_number: 123, ... }
+    // Batch:   { batch: [ { action: "skip", po_number: 123, ... }, ... ] }
+    // Batch mode processes multiple POs in one invocation, checking governance
+    // units between each to stay under the 5,000-unit RESTlet limit.
+    function post(payload) {
+        // ── Single-PO mode (backward compatible) ────────────────────────────
+        if (!payload.batch || !Array.isArray(payload.batch)) {
+            return processSinglePO(payload);
+        }
+
+        // ── Batch mode ──────────────────────────────────────────────────────
+        var items = payload.batch;
+        var script = runtime.getCurrentScript();
+        var startUsage = script.getRemainingUsage();
+        var MIN_GOVERNANCE = 200; // stop if fewer than this many units remain
+
+        log.audit("BATCH_START", "Processing batch of " + items.length + " POs, governance: " + startUsage);
+
+        var results = [];
+        var stopped = 0;
+
+        for (var bi = 0; bi < items.length; bi++) {
+            var remaining = script.getRemainingUsage();
+            if (remaining < MIN_GOVERNANCE) {
+                stopped = items.length - bi;
+                log.audit("BATCH_GOV_STOP", "Stopping at PO " + bi + "/" + items.length +
+                    " — only " + remaining + " governance units left");
+                // Mark remaining as not processed
+                for (var si = bi; si < items.length; si++) {
+                    results.push({
+                        success: false,
+                        po_number: items[si].po_number || null,
+                        error: "governance_exhausted",
+                        skipped: true
+                    });
+                }
+                break;
+            }
+
+            try {
+                results.push(processSinglePO(items[bi]));
+            } catch (batchErr) {
+                log.error("BATCH_PO_ERR", "PO " + (items[bi].po_number || "?") + ": " + batchErr.message);
+                results.push({
+                    success: false,
+                    po_number: items[bi].po_number || null,
+                    error: batchErr.message
+                });
+            }
+        }
+
+        var endUsage = script.getRemainingUsage();
+        log.audit("BATCH_DONE", "Processed " + (items.length - stopped) + "/" + items.length +
+            " POs, governance used: " + (startUsage - endUsage) + ", remaining: " + endUsage);
+
+        return {
+            batch: true,
+            total: items.length,
+            processed: items.length - stopped,
+            stopped: stopped,
+            governanceUsed: startUsage - endUsage,
+            governanceRemaining: endUsage,
+            results: results
         };
     }
 
