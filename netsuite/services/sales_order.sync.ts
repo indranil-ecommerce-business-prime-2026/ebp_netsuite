@@ -1,6 +1,6 @@
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuite } from "./netsuite.client";
-import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import { SYNC_MODE_SO as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 

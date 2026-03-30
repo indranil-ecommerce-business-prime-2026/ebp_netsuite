@@ -1,16 +1,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// NETSUITE SYNC MODE SWITCH
+// NETSUITE SYNC MODE SWITCH (per transaction type)
 //
-// "skip"   → Only CREATE new sales orders in NetSuite. Skip if already exists.
-//            Use this until client confirms update behaviour is safe.
+// "skip"   → Only CREATE new records. Skip if already synced.
+// "update" → CREATE new + UPDATE existing records.
 //
-// "update" → CREATE new + UPDATE existing sales orders in NetSuite.
-//            Switch to this once client confirms.
-//
-// HOW TO TOGGLE: Change the value below and restart the server.
+// HOW TO TOGGLE: Change the values below and restart the server.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const SYNC_MODE: "skip" | "update" = "update";
+export const SYNC_MODE_SO:   "skip" | "update" = "update";   // SO needs update for status changes
+export const SYNC_MODE_PO:   "skip" | "update" = "skip";     // PO: skip — prevents duplicate creation
+export const SYNC_MODE_BILL: "skip" | "update" = "skip";     // Bill: skip — one-time creation
 
 // ⚠️ TEST_MODE: When true, stops after the first real insert/update (skips don't count).
 // Set to false for full production sync.

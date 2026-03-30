@@ -1,6 +1,6 @@
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuiteForPO } from "./netsuite.client";
-import { SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import { SYNC_MODE_PO as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 
@@ -11,8 +11,8 @@ import log from "../config/logger.config";
 // Each HTTP call = 1 RESTlet invocation, so governance is never a concern.
 // Batch limits below control server-side concurrency + NetSuite rate limits.
 const PARALLEL_WORKERS = 5;
-const STOCKING_BATCH = 50;
-const DROPSHIP_BATCH = 20;   // lower — each dropship PO touches SO too
+const STOCKING_BATCH = 70;
+const DROPSHIP_BATCH = 70;   // lower — each dropship PO touches SO too
 
 // Parse created_at safely — sends "M/D/YYYY" to avoid UTC→timezone date shift.
 // NetSuite trandate only needs a date, not a time.
@@ -109,6 +109,17 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
 // ── Process a single PO: RESTlet call + MongoDB status update ─────────────
 async function syncOnePO(collection: any, po: any): Promise<any> {
     const t0 = Date.now();
+
+    // Guard: skip POs without a valid po_number — prevents ghost records in NetSuite
+    if (!po.po_number && po.po_number !== 0) {
+        log.warn(`[NS PO Sync] Skipping PO _id=${po._id} — missing po_number`);
+        await collection.updateOne(
+            { _id: po._id },
+            { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "skipped_no_po_number" } }
+        );
+        return { po_number: null, success: true, action: "skipped", reason: "missing_po_number" };
+    }
+
     try {
         const result = await withConcurrency(() => postToNetsuiteForPO({
             action:                   SYNC_MODE,

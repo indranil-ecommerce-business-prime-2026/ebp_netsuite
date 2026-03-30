@@ -409,15 +409,21 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
             var stocking_warehouse       = payload.stocking_warehouse || "";
             var created_at               = payload.created_at || "";
 
-            if (!po_number) {
-                return { success: false, error: "Missing po_number" };
+            if (!po_number || String(po_number).trim() === "") {
+                return { success: false, error: "Missing or empty po_number" };
+            }
+            // Normalise — ensure both values are non-empty strings
+            po_number = String(po_number).trim();
+            otherrefnum = String(otherrefnum || po_number).trim();
+            if (!otherrefnum) {
+                return { success: false, error: "Missing otherrefnum (po_number resolved to empty)" };
             }
 
             // ── Check if PO already exists in NetSuite ───────────────────────
-            var existing = findPurchaseOrder(String(otherrefnum || po_number));
+            var existing = findPurchaseOrder(otherrefnum);
 
             if (existing && action === "skip") {
-                log.debug("SKIP", "PO " + po_number + " already exists (ID " + existing.id + "). Skipping.");
+                log.audit("SKIP", "PO " + po_number + " already exists (ID " + existing.id + "). Skipping.");
                 return { success: true, action: "skipped", po_number: po_number, internalId: existing.id, poNumber: existing.poNumber };
             }
 
@@ -712,8 +718,24 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                 setPOHeaders(po, headerOpts);
 
             } else {
-                // New standard PO
-                po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+                // ── RACE-CONDITION GUARD: Re-check right before creating ────
+                // SKU resolution + location lookup take time. Another worker may
+                // have created this PO since our first findPurchaseOrder() check.
+                var raceCheck = findPurchaseOrder(otherrefnum);
+                if (raceCheck) {
+                    if (action === "skip") {
+                        log.audit("RACE_GUARD_SKIP", "PO " + po_number + " was created by another worker (ID " + raceCheck.id + "). Skipping.");
+                        return { success: true, action: "skipped", po_number: po_number, internalId: raceCheck.id, poNumber: raceCheck.poNumber, raceGuard: true };
+                    }
+                    // action === "update": load existing instead of creating new
+                    log.audit("RACE_GUARD_UPDATE", "PO " + po_number + " was created by another worker (ID " + raceCheck.id + "). Loading for update.");
+                    po = record.load({ type: record.Type.PURCHASE_ORDER, id: raceCheck.id, isDynamic: true });
+                    isUpdate = true;
+                    existing = raceCheck;
+                } else {
+                    // New standard PO
+                    po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+                }
 
                 var formId2 = findFormId("Ecomm BP - Purchase Order");
                 if (formId2) {

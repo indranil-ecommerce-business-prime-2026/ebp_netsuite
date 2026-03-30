@@ -34,6 +34,7 @@
  *   roles             — roles in the account
  *   scripts           — deployed scripts
  *   item_line_test    — dry-run: creates SO in memory, adds one line, reports fields (no save)
+ *   po_audit          — PO number stats: total, missing, duplicates, recent 10
  *
  * @NApiVersion 2.1
  * @NScriptType Restlet
@@ -1953,40 +1954,72 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query", "N/task", "N/fi
             }
         }
 
-        // ── Cleanup: delete ALL Purchase Orders ─────────────────────────────
-        // POST: { "sections": ["cleanup_all_po"] }                    → dry-run (list only)
-        // POST: { "sections": ["cleanup_all_po"], "confirm": true }   → actually delete
+        // ── Cleanup: delete Purchase Orders (with optional exclude list) ──────
+        // POST: { "sections": ["cleanup_all_po"] }                                          → dry-run (list only)
+        // POST: { "sections": ["cleanup_all_po"], "confirm": true }                         → delete all
+        // POST: { "sections": ["cleanup_all_po"], "confirm": true, "exclude": ["PO228047"] } → delete all except PO228047
+        // "exclude" matches against tranid (e.g. "PO228047") — case-sensitive.
         if (sections.indexOf("cleanup_all_po") >= 0) {
-            log.debug("CLEANUP_ALL_PO", "Step 1: Starting cleanup_all_po, confirm=" + !!payload.confirm);
+            var poExcludeList = payload.exclude || [];
+            var poExcludeSet = {};
+            for (var ei = 0; ei < poExcludeList.length; ei++) {
+                poExcludeSet[poExcludeList[ei]] = true;
+            }
+
             try {
-                log.debug("CLEANUP_ALL_PO", "Step 2: Creating PO search...");
-                var allPoSearch = search.create({
+                // ── Fast path: countOnly uses SuiteQL (no search iteration) ──
+                if (payload.countOnly && !payload.confirm) {
+                    var totalSql = "SELECT COUNT(*) AS cnt FROM transaction WHERE type = 'PurchOrd'";
+                    var totalRes = query.runSuiteQL({ query: totalSql }).asMappedResults();
+                    var totalPOs = parseInt(totalRes[0].cnt, 10);
+
+                    var excludedCount = 0;
+                    if (poExcludeList.length > 0) {
+                        var excludeQuoted = poExcludeList.map(function (e) { return "'" + e.replace(/'/g, "''") + "'"; }).join(", ");
+                        var excludeSql = "SELECT COUNT(*) AS cnt FROM transaction WHERE type = 'PurchOrd' AND tranid IN (" + excludeQuoted + ")";
+                        var excludeRes = query.runSuiteQL({ query: excludeSql }).asMappedResults();
+                        excludedCount = parseInt(excludeRes[0].cnt, 10);
+                    }
+
+                    result.cleanup_all_po = {
+                        mode: "dry_run",
+                        found: totalPOs - excludedCount,
+                        excluded: excludedCount,
+                        message: "Pass { \"confirm\": true } to delete. Excluded POs will be kept."
+                    };
+                    // skip the rest of cleanup_all_po
+                } else {
+
+                var allPoSearchResults = [];
+                var allPoExcluded = [];
+                search.create({
                     type: search.Type.PURCHASE_ORDER,
                     filters: [["mainline", "is", "T"]],
                     columns: ["internalid", "tranid", "otherrefnum"]
-                });
-                log.debug("CLEANUP_ALL_PO", "Step 3: Search created, running...");
-                var allPoRunResults = allPoSearch.run();
-                log.debug("CLEANUP_ALL_PO", "Step 4: Run complete, iterating...");
-                var allPoSearchResults = [];
-                allPoRunResults.each(function (r) {
-                    log.debug("CLEANUP_ALL_PO", "Step 4a: Row — id=" + r.getValue("internalid") + " tranid=" + r.getValue("tranid"));
-                    allPoSearchResults.push({
+                }).run().each(function (r) {
+                    var entry = {
                         id: r.getValue("internalid"),
                         poNumber: r.getValue("tranid"),
                         otherrefnum: r.getValue("otherrefnum") || ""
-                    });
-                    return allPoSearchResults.length < 500;
+                    };
+                    if (poExcludeSet[entry.poNumber]) {
+                        allPoExcluded.push(entry);
+                    } else {
+                        allPoSearchResults.push(entry);
+                    }
+                    return (allPoSearchResults.length + allPoExcluded.length) < 4000;
                 });
 
-                log.debug("CLEANUP_ALL_PO", "Step 5: Found " + allPoSearchResults.length + " POs");
+                log.audit("CLEANUP_ALL_PO", "Found " + allPoSearchResults.length + " to delete, " + allPoExcluded.length + " excluded");
 
                 if (!payload.confirm) {
                     result.cleanup_all_po = {
                         mode: "dry_run",
                         found: allPoSearchResults.length,
+                        excluded: allPoExcluded.length,
+                        excludedOrders: allPoExcluded,
                         orders: allPoSearchResults,
-                        message: "Pass { \"confirm\": true } to delete these."
+                        message: "Pass { \"confirm\": true } to delete. Excluded POs will be kept."
                     };
                 } else {
                     var poDeleted = 0;
@@ -2008,9 +2041,12 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query", "N/task", "N/fi
                         found: allPoSearchResults.length,
                         deleted: poDeleted,
                         failed: poFailed,
+                        excluded: allPoExcluded.length,
+                        excludedOrders: allPoExcluded,
                         details: poDelDetails
                     };
                 }
+                } // end else (non-countOnly path)
             } catch (e) {
                 log.error("CLEANUP_ALL_PO_ERROR", e.name + ": " + e.message);
                 result.cleanup_all_po = { error: e.message };
@@ -2275,6 +2311,41 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query", "N/task", "N/fi
                     log.error("TRIGGER_FIELDS_MR", ufErr.message);
                     result.trigger_fields_mr = { error: ufErr.message };
                 }
+            }
+        }
+
+        // ── PO Audit — PO number stats from ERP ─────────────────────────
+        if (sections.indexOf("po_audit") >= 0) {
+            try {
+                var poAudit = {};
+
+                // Total PO count
+                var totalSql = "SELECT COUNT(*) AS cnt FROM transaction WHERE type = 'PurchOrd'";
+                var totalRes = query.runSuiteQL({ query: totalSql }).asMappedResults();
+                poAudit.total = parseInt(totalRes[0].cnt, 10);
+
+                // POs missing otherrefnum (our po_number)
+                var noRefSql = "SELECT COUNT(*) AS cnt FROM transaction WHERE type = 'PurchOrd' AND (otherrefnum IS NULL OR otherrefnum = '')";
+                var noRefRes = query.runSuiteQL({ query: noRefSql }).asMappedResults();
+                poAudit.missing_po_number = parseInt(noRefRes[0].cnt, 10);
+
+                // Duplicate otherrefnum values
+                var dupSql = "SELECT otherrefnum, COUNT(*) AS cnt FROM transaction WHERE type = 'PurchOrd' AND otherrefnum IS NOT NULL AND otherrefnum != '' GROUP BY otherrefnum HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC";
+                var dupRes = query.runSuiteQL({ query: dupSql }).asMappedResults();
+                poAudit.duplicate_po_numbers = dupRes.length;
+                poAudit.duplicates = dupRes.map(function (r) {
+                    return { po_number: r.otherrefnum, count: parseInt(r.cnt, 10) };
+                });
+
+                // Recent POs (last 10) — for quick reference
+                var recentSql = "SELECT id, tranid, otherrefnum, status, trandate, BUILTIN.DF(entity) AS vendor FROM transaction WHERE type = 'PurchOrd' ORDER BY id DESC FETCH FIRST 10 ROWS ONLY";
+                var recentRes = query.runSuiteQL({ query: recentSql }).asMappedResults();
+                poAudit.recent = recentRes;
+
+                result.po_audit = poAudit;
+            } catch (poAuditErr) {
+                log.error("PO_AUDIT", poAuditErr.message);
+                result.po_audit = { error: poAuditErr.message };
             }
         }
 
